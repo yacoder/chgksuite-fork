@@ -13,7 +13,7 @@ from pypdf.generic import (
     StreamObject,
 )
 
-from chgksuite.common import image_file_to_jpeg_bytes, pil_image_to_jpeg_bytes
+from chgksuite.common import optimize_raster_image_data, pil_image_to_jpeg_bytes
 from chgksuite.handouter.installer import escape_latex
 
 RESERVED_WORDS = [
@@ -472,14 +472,25 @@ def optimize_raster_image_for_tex(path, quality=80):
     except OSError:
         return path
 
-    fd, tmp = tempfile.mkstemp(suffix=".jpg")
-    os.close(fd)
-    jpeg_data = image_file_to_jpeg_bytes(path, quality=quality, exif_transpose=True)
-    if jpeg_data is None:
-        os.remove(tmp)
+    try:
+        with open(path, "rb") as source:
+            optimized = optimize_raster_image_data(
+                source.read(),
+                original_extension=ext,
+                quality=quality,
+                exif_transpose=True,
+            )
+    except OSError:
         return path
+
+    if optimized is None:
+        return path
+
+    optimized_extension, _, optimized_data = optimized
+    fd, tmp = tempfile.mkstemp(suffix=f".{optimized_extension}")
+    os.close(fd)
     with open(tmp, "wb") as output:
-        output.write(jpeg_data)
+        output.write(optimized_data)
 
     if os.stat(tmp).st_size >= size_before:
         os.remove(tmp)

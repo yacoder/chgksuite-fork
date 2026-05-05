@@ -1,3 +1,4 @@
+from io import BytesIO
 from pathlib import Path
 import random
 import zipfile
@@ -154,6 +155,34 @@ def test_optimize_pptx_images_recompresses_png_as_jpeg(tmp_path):
     assert pptx_path.stat().st_size < original_size
     assert 'Extension="jpg" ContentType="image/jpeg"' in content_types
     assert 'Target="../media/image1.jpg"' in rels
+
+
+def test_optimize_pptx_images_preserves_transparent_png(tmp_path):
+    image_path = tmp_path / "transparent.png"
+    Image.new("RGBA", (120, 120), (255, 0, 0, 128)).save(
+        image_path, format="PNG", compress_level=0
+    )
+    pptx_path = tmp_path / "transparent.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(str(image_path), PptxInches(1), PptxInches(1))
+    prs.save(pptx_path)
+
+    optimized_parts = optimize_pptx_images(pptx_path, quality=80)
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        names = pptx_file.namelist()
+        rels = pptx_file.read("ppt/slides/_rels/slide1.xml.rels").decode("utf-8")
+        image_names = [name for name in names if name.startswith("ppt/media/")]
+        image_data = pptx_file.read(image_names[0])
+
+    assert optimized_parts == {"ppt/media/image1.png": "ppt/media/image1.png"}
+    assert image_names == ["ppt/media/image1.png"]
+    assert not image_data.startswith(b"\xff\xd8")
+    assert 'Target="../media/image1.png"' in rels
+    with Image.open(BytesIO(image_data)) as image:
+        assert image.convert("RGBA").getchannel("A").getextrema()[0] < 255
+    Presentation(str(pptx_path))
 
 
 def test_pptx_exporter_optimizes_size_by_default(tmp_path, monkeypatch):

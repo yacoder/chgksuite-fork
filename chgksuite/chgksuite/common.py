@@ -190,6 +190,31 @@ def pil_image_to_jpeg_bytes(image, quality=80, exif_transpose=False):
     return output.getvalue()
 
 
+def pil_image_has_transparency(image):
+    if image.mode in ("RGBA", "LA"):
+        return image.getchannel("A").getextrema()[0] < 255
+    if image.mode == "P" and "transparency" in image.info:
+        transparency = image.info["transparency"]
+        if isinstance(transparency, int):
+            return any(pixel == transparency for pixel in image.getdata())
+        return any(alpha < 255 for alpha in transparency)
+    return False
+
+
+def pil_image_to_png_bytes(image, exif_transpose=False, compress_level=9):
+    from PIL import ImageOps
+
+    if exif_transpose:
+        image = ImageOps.exif_transpose(image)
+
+    output = BytesIO()
+    save_kwargs = {"format": "PNG", "optimize": True, "compress_level": compress_level}
+    if image.mode == "P" and "transparency" in image.info:
+        save_kwargs["transparency"] = image.info["transparency"]
+    image.save(output, **save_kwargs)
+    return output.getvalue()
+
+
 def image_data_to_jpeg_bytes(image_data, quality=80, exif_transpose=False):
     from PIL import Image, UnidentifiedImageError
 
@@ -200,6 +225,52 @@ def image_data_to_jpeg_bytes(image_data, quality=80, exif_transpose=False):
             )
     except (OSError, UnidentifiedImageError):
         return None
+
+
+def optimize_raster_image_data(
+    image_data, original_extension="", quality=80, exif_transpose=False
+):
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        with Image.open(BytesIO(image_data)) as image:
+            if exif_transpose:
+                image = ImageOps.exif_transpose(image)
+            has_transparency = pil_image_has_transparency(image)
+            candidates = []
+            if has_transparency:
+                candidates.append(
+                    (
+                        "png",
+                        "image/png",
+                        pil_image_to_png_bytes(image),
+                    )
+                )
+            else:
+                candidates.append(
+                    (
+                        "jpg",
+                        "image/jpeg",
+                        pil_image_to_jpeg_bytes(image, quality=quality),
+                    )
+                )
+                if original_extension.lower().lstrip(".") == "png":
+                    candidates.append(
+                        (
+                            "png",
+                            "image/png",
+                            pil_image_to_png_bytes(image),
+                        )
+                    )
+    except (OSError, UnidentifiedImageError):
+        return None
+
+    candidates = [
+        candidate for candidate in candidates if len(candidate[2]) < len(image_data)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: len(candidate[2]))
 
 
 def image_file_to_jpeg_bytes(path, quality=80, exif_transpose=True):
@@ -297,16 +368,16 @@ def _ooxml_relationship_target_for_part(rels_part_name, part_name):
     return posixpath.relpath(part_name, posixpath.dirname(source_part))
 
 
-def _next_ooxml_media_part_name(existing_names, original_part_name):
+def _next_ooxml_media_part_name(existing_names, original_part_name, extension="jpg"):
     dirname = posixpath.dirname(original_part_name)
     stem = posixpath.splitext(posixpath.basename(original_part_name))[0]
-    candidate = posixpath.join(dirname, f"{stem}.jpg")
+    candidate = posixpath.join(dirname, f"{stem}.{extension}")
     if candidate not in existing_names:
         return candidate
 
     index = 1
     while True:
-        candidate = posixpath.join(dirname, f"{stem}_{index}.jpg")
+        candidate = posixpath.join(dirname, f"{stem}_{index}.{extension}")
         if candidate not in existing_names:
             return candidate
         index += 1
@@ -365,24 +436,36 @@ def optimize_ooxml_images(package_path, media_prefix, rels_prefix, quality=80):
     removals = set()
     optimized_parts = {}
     renamed_parts = {}
+    optimized_content_types = {}
     reserved_names = set(existing_names)
 
     for media_name, image_data in media_data.items():
-        jpeg_data = image_data_to_jpeg_bytes(image_data, quality=quality)
-        if not jpeg_data or len(jpeg_data) >= len(image_data):
+        original_extension = posixpath.splitext(media_name)[1].lower().lstrip(".")
+        optimized = optimize_raster_image_data(
+            image_data, original_extension=original_extension, quality=quality
+        )
+        if not optimized:
             continue
 
-        extension = posixpath.splitext(media_name)[1].lower()
-        if extension in (".jpg", ".jpeg"):
+        optimized_extension, content_type, optimized_data = optimized
+        same_extension = optimized_extension == original_extension or (
+            optimized_extension == "jpg" and original_extension == "jpeg"
+        )
+        if same_extension:
             new_name = media_name
+            content_extension = original_extension
         else:
-            new_name = _next_ooxml_media_part_name(reserved_names, media_name)
+            new_name = _next_ooxml_media_part_name(
+                reserved_names, media_name, extension=optimized_extension
+            )
             reserved_names.add(new_name)
             removals.add(media_name)
             renamed_parts[media_name] = new_name
+            content_extension = optimized_extension
 
-        replacements[new_name] = jpeg_data
+        replacements[new_name] = optimized_data
         optimized_parts[media_name] = new_name
+        optimized_content_types[content_extension] = content_type
 
     if not optimized_parts:
         return {}
@@ -412,8 +495,10 @@ def optimize_ooxml_images(package_path, media_prefix, rels_prefix, quality=80):
                 rels_root, default_namespace=_OOXML_PACKAGE_REL_NS
             )
 
-    _ensure_ooxml_content_type_default(content_types_root, "jpg", "image/jpeg")
-    _ensure_ooxml_content_type_default(content_types_root, "jpeg", "image/jpeg")
+    for extension, content_type in sorted(optimized_content_types.items()):
+        _ensure_ooxml_content_type_default(content_types_root, extension, content_type)
+    if optimized_content_types.get("jpg") == "image/jpeg":
+        _ensure_ooxml_content_type_default(content_types_root, "jpeg", "image/jpeg")
     for old_part_name in renamed_parts:
         _remove_ooxml_content_type_override(content_types_root, f"/{old_part_name}")
     replacements["[Content_Types].xml"] = _ooxml_xml_bytes(

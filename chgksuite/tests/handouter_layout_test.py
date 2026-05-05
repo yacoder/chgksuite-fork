@@ -373,6 +373,23 @@ def test_optimize_raster_image_for_tex_keeps_smaller_original(tmp_path):
     assert optimize_raster_image_for_tex(str(image_path), quality=80) == str(image_path)
 
 
+def test_optimize_raster_image_for_tex_preserves_transparent_png(tmp_path):
+    image_path = tmp_path / "transparent.png"
+    Image.new("RGBA", (96, 96), (255, 0, 0, 128)).save(
+        image_path, format="PNG", compress_level=0
+    )
+
+    optimized_path = optimize_raster_image_for_tex(str(image_path), quality=80)
+
+    try:
+        assert optimized_path.endswith(".png")
+        with Image.open(optimized_path) as image:
+            assert image.convert("RGBA").getchannel("A").getextrema()[0] < 255
+    finally:
+        if optimized_path != str(image_path):
+            os.remove(optimized_path)
+
+
 def test_recompress_pdf_image_converts_raw_rgb_to_smaller_jpeg():
     image = Image.new("RGB", (96, 96))
     rng = random.Random(2)
