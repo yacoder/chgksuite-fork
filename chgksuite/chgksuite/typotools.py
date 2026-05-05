@@ -304,7 +304,7 @@ def get_dashes_right(s):
     return s
 
 
-def replace_no_break(s, spaces=True, hyphens=True):
+def _replace_no_break_segment(s, spaces=True, hyphens=True):
     if spaces:
         for sp in NO_BREAK_SEQUENCES + [x.title() for x in NO_BREAK_SEQUENCES]:
             r_from = "(^|[ \u00a0]){sp} ".format(sp=sp)
@@ -324,6 +324,23 @@ def replace_no_break(s, spaces=True, hyphens=True):
             )  # non-breaking hyphen
             srch = re_nbh.search(s)
     return s
+
+
+def replace_no_break(s, spaces=True, hyphens=True):
+    spans = iter_url_spans(s)
+    if not spans:
+        return _replace_no_break_segment(s, spaces=spaces, hyphens=hyphens)
+
+    chunks = []
+    pos = 0
+    for start, end in spans:
+        if start < pos:
+            continue
+        chunks.append(_replace_no_break_segment(s[pos:start], spaces, hyphens))
+        chunks.append(s[start:end])
+        pos = end
+    chunks.append(_replace_no_break_segment(s[pos:], spaces, hyphens))
+    return "".join(chunks)
 
 
 def detect_accent(s):

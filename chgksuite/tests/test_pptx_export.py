@@ -282,7 +282,7 @@ def test_pptx_exporter_embeds_fonts_when_enabled(tmp_path, monkeypatch):
 
 
 def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
-    url = "https://example.com/привет?q=тест"
+    url = "https://example.com/ик-с?q=тест"
     encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
     pptx_path = _export_pptx_path(
         tmp_path,
@@ -390,7 +390,9 @@ def test_title_slide_uses_full_height_centered_textbox(tmp_path):
 
     title = prs.slides[0].shapes.title
 
-    assert title.text_frame.auto_size == MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    assert title.text_frame.auto_size == MSO_AUTO_SIZE.NONE
+    assert "<a:noAutofit" in title.element.txBody.xml
+    assert "<a:normAutofit" not in title.element.txBody.xml
     assert title.text_frame.vertical_anchor == MSO_VERTICAL_ANCHOR.MIDDLE
     assert round(title.left / 914400, 2) == 0.8
     assert round(title.top / 914400, 2) == 0.8
@@ -568,9 +570,9 @@ def test_pptx_textboxes_shrink_text_and_stamp_run_sizes(tmp_path):
     assert len(textboxes) == 1
     textbox = textboxes[0]
 
-    assert textbox.text_frame.auto_size == MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-    assert "<a:normAutofit" in textbox.element.txBody.xml
-    assert 'lnSpcReduction="0"' not in textbox.element.txBody.xml
+    assert textbox.text_frame.auto_size == MSO_AUTO_SIZE.NONE
+    assert "<a:noAutofit" in textbox.element.txBody.xml
+    assert "<a:normAutofit" not in textbox.element.txBody.xml
     assert "<a:lnSpc>" not in textbox.element.txBody.xml
     assert "<a:spAutoFit" not in textbox.element.txBody.xml
 
@@ -582,8 +584,8 @@ def test_pptx_textboxes_shrink_text_and_stamp_run_sizes(tmp_path):
     ]
     run_sizes = [run.font.size.pt for run in runs]
     assert run_sizes
-    assert {run.font.size.pt for run in runs if "Тур 2" in run.text} == {42.0}
-    assert {run.font.size.pt for run in runs if "Тур 2" not in run.text} == {32.0}
+    assert {run.font.size.pt for run in runs if "Тур 2" in run.text} == {34.0}
+    assert {run.font.size.pt for run in runs if "Тур 2" not in run.text} == {24.0}
     assert {paragraph.line_spacing for paragraph in textbox.text_frame.paragraphs} == {
         None
     }
@@ -612,8 +614,9 @@ def test_fixed_line_spacing_keeps_config_spacing_with_shrink_fit(tmp_path):
         for shape in prs.slides[1].shapes
         if hasattr(shape, "text_frame") and "Вопрос." in shape.text
     )
-    assert question_shape.text_frame.auto_size == MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-    assert 'lnSpcReduction="0"' in question_shape.element.txBody.xml
+    assert question_shape.text_frame.auto_size == MSO_AUTO_SIZE.NONE
+    assert "<a:noAutofit" in question_shape.element.txBody.xml
+    assert "<a:normAutofit" not in question_shape.element.txBody.xml
     assert '<a:spcPts val="2400"/>' in question_shape.element.txBody.xml
     assert {
         paragraph.line_spacing.pt for paragraph in question_shape.text_frame.paragraphs
@@ -659,7 +662,7 @@ def test_line_spacing_multiplier_sets_percent_spacing(tmp_path):
         for shape in prs.slides[1].shapes
         if hasattr(shape, "text_frame") and "Вопрос." in shape.text
     )
-    assert 'lnSpcReduction="0"' in question_shape.element.txBody.xml
+    assert "<a:normAutofit" not in question_shape.element.txBody.xml
     assert '<a:spcPct val="120000"/>' in question_shape.element.txBody.xml
     assert {
         paragraph.line_spacing for paragraph in question_shape.text_frame.paragraphs
@@ -1045,7 +1048,7 @@ def test_inline_handout_uses_handout_config_when_not_separate_slide(tmp_path):
     assert {
         run.font.size.pt for run in handout_paragraph.runs if run.text.strip()
     } == {32.0}
-    assert handout_paragraph.space_after.pt == 18.0
+    assert handout_paragraph.space_after.pt == 72.0
     assert question_paragraph.text.startswith("Чтобы спастись")
     assert {
         run.font.size.pt for run in question_paragraph.runs if run.text.strip()
