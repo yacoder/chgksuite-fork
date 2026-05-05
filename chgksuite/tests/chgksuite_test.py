@@ -915,6 +915,7 @@ def test_embed_fonts_in_docx_embeds_obfuscated_regular_font(tmp_path):
         content_types = docx_file.read("[Content_Types].xml").decode("utf-8")
         font_rels = docx_file.read("word/_rels/fontTable.xml.rels").decode("utf-8")
         font_table = ET.fromstring(docx_file.read("word/fontTable.xml"))
+        settings = ET.fromstring(docx_file.read("word/settings.xml"))
         rels = ET.fromstring(font_rels)
 
         w_name = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}name"
@@ -939,6 +940,7 @@ def test_embed_fonts_in_docx_embeds_obfuscated_regular_font(tmp_path):
     assert "<ns0:" not in content_types
     assert "<ns0:" not in font_rels
     assert rel.get("Type").endswith("/font")
+    assert any(element.tag.endswith("embedTrueTypeFonts") for element in settings.iter())
 
     deobfuscated = bytearray(embedded_font)
     key = uuid.UUID(font_key.strip("{}")).bytes[::-1]
@@ -965,6 +967,7 @@ def test_embed_fonts_in_docx_subsets_to_used_characters(tmp_path):
 
     with zipfile.ZipFile(docx_path) as docx_file:
         font_table = ET.fromstring(docx_file.read("word/fontTable.xml"))
+        settings = ET.fromstring(docx_file.read("word/settings.xml"))
         rels = ET.fromstring(docx_file.read("word/_rels/fontTable.xml.rels"))
         embed_regular = next(
             element
@@ -990,6 +993,7 @@ def test_embed_fonts_in_docx_subsets_to_used_characters(tmp_path):
     assert 65 in cmap
     assert 66 in cmap
     assert 67 not in cmap
+    assert any(element.tag.endswith("saveSubsetFonts") for element in settings.iter())
 
 
 def test_embed_fonts_in_pptx_embeds_subset_font_data(tmp_path):

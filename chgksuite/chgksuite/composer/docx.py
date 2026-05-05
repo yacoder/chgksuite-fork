@@ -437,6 +437,14 @@ def _next_font_part_name(existing_names, extension=".odttf"):
     return f"word/fonts/font{index}{extension}"
 
 
+def _ensure_word_setting(settings_root, tag_name):
+    tag = f"{{{_W_NS}}}{tag_name}"
+    existing = settings_root.find(tag)
+    if existing is not None:
+        return existing
+    return ET.SubElement(settings_root, tag)
+
+
 def _obfuscate_font(font_path, font_guid):
     with open(font_path, "rb") as font_file:
         font_data = bytearray(font_file.read())
@@ -599,6 +607,11 @@ def embed_fonts_in_docx(
                 "word/fontTable.xml",
                 ET.Element(f"{{{_W_NS}}}fonts"),
             )
+            settings_root = _load_xml_part(
+                docx_zip,
+                "word/settings.xml",
+                ET.Element(f"{{{_W_NS}}}settings"),
+            )
             rels_root = _load_xml_part(
                 docx_zip,
                 "word/_rels/fontTable.xml.rels",
@@ -650,12 +663,17 @@ def embed_fonts_in_docx(
                     {f"{{{_R_NS}}}id": rel_id, f"{{{_W_NS}}}fontKey": font_key},
                 )
 
+        _ensure_word_setting(settings_root, "embedTrueTypeFonts")
+        if subset_characters is not None:
+            _ensure_word_setting(settings_root, "saveSubsetFonts")
+
         replacements.update(
             {
                 "[Content_Types].xml": _xml_bytes(
                     content_types_root, default_namespace=_CONTENT_TYPES_NS
                 ),
                 "word/fontTable.xml": _xml_bytes(font_table_root),
+                "word/settings.xml": _xml_bytes(settings_root),
                 "word/_rels/fontTable.xml.rels": _xml_bytes(
                     rels_root, default_namespace=_PACKAGE_REL_NS
                 ),
@@ -893,7 +911,25 @@ def format_docx_element(
 
         el = backtick_replace(el)
 
-        for run in _parse_4s_elem(el, logger=logger):
+        runs = list(_parse_4s_elem(el, logger=logger))
+
+        def token_text(token):
+            if token[0] == "screen":
+                if remove_accents or remove_brackets:
+                    return token[1]["for_screen"]
+                return token[1]["for_print"]
+            if token[0] == "linebreak":
+                return "\n"
+            if token[0] in ("img", "pagebreak"):
+                return ""
+            return token[1]
+
+        def token_starts_with_break(token):
+            return str(token_text(token)).startswith("\n")
+
+        at_line_start = para.text.endswith("\n")
+
+        for index, run in enumerate(runs):
             if run[0] == "pagebreak":
                 if spoilers == "dots":
                     for _ in range(30):
@@ -902,8 +938,10 @@ def format_docx_element(
                     para = doc.add_paragraph()
                 else:
                     para = doc.add_page_break()
+                at_line_start = True
             elif run[0] == "linebreak":
                 para.add_run("\n")
+                at_line_start = True
             elif run[0] == "screen":
                 if remove_accents or remove_brackets:
                     text = run[1]["for_screen"]
@@ -912,11 +950,14 @@ def format_docx_element(
                 if replace_no_break_spaces:
                     text = replace_no_break_standalone(text)
                 r = add_text_run_to_docx(para, text)
+                at_line_start = str(text).endswith("\n")
             elif run[0] == "hyperlink" and not (whiten and spoilers == "whiten"):
                 r = add_hyperlink_to_docx(doc, para, run[1], run[1])
+                at_line_start = False
             elif run[0] == "img":
                 if run[1].endswith(".shtml"):
                     r = para.add_run("(ТУТ БЫЛА ССЫЛКА НА ПРОТУХШУЮ КАРТИНКУ)\n")
+                    at_line_start = True
                     continue
                 try:
                     parsed_image = parseimg(
@@ -932,6 +973,7 @@ def format_docx_element(
                         sys.stderr.write(f"MISSING IMAGE: {filename}\n")
                         r = para.add_run(f"\nMISSING IMAGE {filename}\n")
                         r.bold = True
+                        at_line_start = True
                         continue
                     raise
                 imgfile = parsed_image["imgfile"]
@@ -941,7 +983,7 @@ def format_docx_element(
                 if inline:
                     r = para.add_run("")
                 else:
-                    r = para.add_run("\n")
+                    r = para.add_run("" if at_line_start else "\n")
 
                 try:
                     if inline:
@@ -955,7 +997,14 @@ def format_docx_element(
                         f"python-docx can't recognize header for {imgfile}\n"
                     )
                 if not inline:
-                    r = para.add_run("\n")
+                    next_run = runs[index + 1] if index + 1 < len(runs) else None
+                    if next_run is None or not token_starts_with_break(next_run):
+                        para.add_run("\n")
+                        at_line_start = True
+                    else:
+                        at_line_start = False
+                else:
+                    at_line_start = False
                 continue
             else:
                 text = run[1]
@@ -970,6 +1019,7 @@ def format_docx_element(
                     r.underline = True
                 if run[0] == "strike":
                     r.font.strike = True
+                at_line_start = str(text).endswith("\n")
                 if run[0] == "sc":
                     r.small_caps = True
                 if whiten and spoilers == "whiten":
