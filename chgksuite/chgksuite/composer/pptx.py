@@ -4,7 +4,7 @@ import re
 
 import toml
 
-from chgksuite.common import log_wrap, replace_escaped, tryint
+from chgksuite.common import log_wrap, optimize_ooxml_images, replace_escaped, tryint
 from chgksuite.composer.composer_common import (
     BaseExporter,
     backtick_replace,
@@ -18,6 +18,16 @@ from pptx.enum.lang import MSO_LANGUAGE_ID
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
+
+
+def _optimize_size_enabled(args):
+    return (getattr(args, "optimize_size", None) or "on") == "on"
+
+
+def optimize_pptx_images(pptx_path, quality=80):
+    return optimize_ooxml_images(
+        pptx_path, media_prefix="ppt/media/", rels_prefix="ppt/", quality=quality
+    )
 
 
 class PptxExporter(BaseExporter):
@@ -1156,4 +1166,6 @@ class PptxExporter(BaseExporter):
         self._add_service_slides("final")
         self._remove_service_slide_templates()
         self.prs.save(outfilename)
+        if _optimize_size_enabled(self.args):
+            optimize_pptx_images(outfilename, quality=80)
         self.logger.info("Output: {}".format(outfilename))

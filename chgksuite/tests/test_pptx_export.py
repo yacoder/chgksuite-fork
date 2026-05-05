@@ -1,6 +1,9 @@
 from pathlib import Path
+import random
+import zipfile
 
 import toml
+from PIL import Image
 from pptx import Presentation
 from pptx.enum.text import PP_ALIGN
 from pptx.enum.text import MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
@@ -8,7 +11,7 @@ from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
 
 from chgksuite.common import DefaultArgs
-from chgksuite.composer.pptx import PptxExporter
+from chgksuite.composer.pptx import PptxExporter, optimize_pptx_images
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +42,8 @@ def _config_path(tmp_path, updates=None):
     return str(path)
 
 
-def _pptx_args(tmp_path, font=None, config_updates=None):
-    return DefaultArgs(
+def _pptx_args(tmp_path, font=None, config_updates=None, optimize_size=None):
+    args = DefaultArgs(
         pptx_config=_config_path(tmp_path, config_updates),
         labels_file=str(RESOURCES / "labels_ru.toml"),
         regexes_file=str(RESOURCES / "regexes_ru.json"),
@@ -49,17 +52,39 @@ def _pptx_args(tmp_path, font=None, config_updates=None):
         replace_no_break_hyphens="on",
         font=font,
     )
+    if optimize_size is not None:
+        args.optimize_size = optimize_size
+    return args
 
 
-def _export_pptx(tmp_path, structure, font=None, config_updates=None):
+def _export_pptx(
+    tmp_path, structure, font=None, config_updates=None, optimize_size=None
+):
     outfilename = tmp_path / "out.pptx"
     exporter = PptxExporter(
         structure,
-        _pptx_args(tmp_path, font=font, config_updates=config_updates),
+        _pptx_args(
+            tmp_path,
+            font=font,
+            config_updates=config_updates,
+            optimize_size=optimize_size,
+        ),
         {"tmp_dir": str(tmp_path), "targetdir": str(tmp_path)},
     )
     exporter.export(str(outfilename))
     return Presentation(str(outfilename))
+
+
+def _write_noisy_png(path):
+    rng = random.Random(0)
+    image = Image.new("RGB", (180, 180))
+    image.putdata(
+        [
+            (rng.randrange(256), rng.randrange(256), rng.randrange(256))
+            for _ in range(180 * 180)
+        ]
+    )
+    image.save(path)
 
 
 def _soft_breaks_as_newlines(text):
@@ -102,6 +127,66 @@ def _service_slide_template(tmp_path):
     path = tmp_path / "service-template.pptx"
     prs.save(path)
     return path
+
+
+def test_optimize_pptx_images_recompresses_png_as_jpeg(tmp_path):
+    image_path = tmp_path / "source.png"
+    _write_noisy_png(image_path)
+    pptx_path = tmp_path / "image.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(str(image_path), PptxInches(1), PptxInches(1))
+    prs.save(pptx_path)
+    original_size = pptx_path.stat().st_size
+
+    renamed_parts = optimize_pptx_images(pptx_path, quality=80)
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        names = pptx_file.namelist()
+        content_types = pptx_file.read("[Content_Types].xml").decode("utf-8")
+        rels = pptx_file.read("ppt/slides/_rels/slide1.xml.rels").decode("utf-8")
+        image_names = [name for name in names if name.startswith("ppt/media/")]
+        image_data = pptx_file.read(image_names[0])
+
+    assert renamed_parts == {"ppt/media/image1.png": "ppt/media/image1.jpg"}
+    assert image_names == ["ppt/media/image1.jpg"]
+    assert image_data.startswith(b"\xff\xd8")
+    assert pptx_path.stat().st_size < original_size
+    assert 'Extension="jpg" ContentType="image/jpeg"' in content_types
+    assert 'Target="../media/image1.jpg"' in rels
+
+
+def test_pptx_exporter_optimizes_size_by_default(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_optimize(pptx_path, quality=80):
+        calls.append((Path(pptx_path).name, quality))
+        return {}
+
+    monkeypatch.setattr("chgksuite.composer.pptx.optimize_pptx_images", fake_optimize)
+    _export_pptx(
+        tmp_path,
+        [("Question", {"question": "Вопрос.", "answer": "Ответ."})],
+    )
+
+    assert calls == [("out.pptx", 80)]
+
+
+def test_pptx_exporter_can_disable_size_optimization(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_optimize(pptx_path, quality=80):
+        calls.append((Path(pptx_path).name, quality))
+        return {}
+
+    monkeypatch.setattr("chgksuite.composer.pptx.optimize_pptx_images", fake_optimize)
+    _export_pptx(
+        tmp_path,
+        [("Question", {"question": "Вопрос.", "answer": "Ответ."})],
+        optimize_size="off",
+    )
+
+    assert calls == []
 
 
 def test_title_slide_uses_full_height_centered_textbox(tmp_path):

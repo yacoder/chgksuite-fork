@@ -695,6 +695,16 @@ class ArgparseBuilder:
         )
         self.add_argument(
             cmdcompose_pptx,
+            "--optimize_size",
+            choices=["on", "off"],
+            default=default_overrides.get("optimize_size") or "on",
+            help="recompress images to reduce PPTX size.",
+            advanced=True,
+            caption="Оптимизировать размер",
+            argtype="radiobutton",
+        )
+        self.add_argument(
+            cmdcompose_pptx,
             "--do_dot_remove_accents",
             help="do not remove accents.",
             advanced=True,

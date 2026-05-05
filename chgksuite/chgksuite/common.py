@@ -6,12 +6,16 @@ import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import sys
+import tempfile
 import time
+import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import openpyxl
 import toml
@@ -216,6 +220,208 @@ def save_pil_image_as_jpeg(image, path, quality=80, exif_transpose=False):
     )
     with open(path, "wb") as output:
         output.write(jpeg_data)
+
+
+_OOXML_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_OOXML_IMAGE_REL_TYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+)
+
+
+def _ooxml_xml_bytes(root, default_namespace=None):
+    if default_namespace:
+        ET.register_namespace("", default_namespace)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _load_ooxml_xml_part(package_zip, name, default_root):
+    try:
+        return ET.fromstring(package_zip.read(name))
+    except KeyError:
+        return default_root
+
+
+def _ensure_ooxml_content_type_default(content_types_root, extension, content_type):
+    for default in content_types_root.findall(f"{{{_OOXML_CONTENT_TYPES_NS}}}Default"):
+        if default.get("Extension") == extension:
+            default.set("ContentType", content_type)
+            return
+    default = ET.Element(
+        f"{{{_OOXML_CONTENT_TYPES_NS}}}Default",
+        {"Extension": extension, "ContentType": content_type},
+    )
+    insert_at = 0
+    for index, child in enumerate(list(content_types_root)):
+        if child.tag == f"{{{_OOXML_CONTENT_TYPES_NS}}}Override":
+            insert_at = index
+            break
+        insert_at = index + 1
+    content_types_root.insert(insert_at, default)
+
+
+def _remove_ooxml_content_type_override(content_types_root, part_name):
+    for override in list(
+        content_types_root.findall(f"{{{_OOXML_CONTENT_TYPES_NS}}}Override")
+    ):
+        if override.get("PartName") == part_name:
+            content_types_root.remove(override)
+
+
+def _ooxml_rels_source_part(rels_part_name):
+    rels_dir = posixpath.dirname(rels_part_name)
+    if posixpath.basename(rels_dir) != "_rels":
+        return None
+    source_dir = posixpath.dirname(rels_dir)
+    source_name = posixpath.basename(rels_part_name)[: -len(".rels")]
+    if not source_dir:
+        return source_name
+    return posixpath.join(source_dir, source_name)
+
+
+def _ooxml_relationship_target_part(rels_part_name, target):
+    if not target:
+        return None
+    if target.startswith("/"):
+        return posixpath.normpath(target.lstrip("/"))
+    source_part = _ooxml_rels_source_part(rels_part_name)
+    if source_part is None:
+        return None
+    return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
+
+
+def _ooxml_relationship_target_for_part(rels_part_name, part_name):
+    source_part = _ooxml_rels_source_part(rels_part_name)
+    if source_part is None:
+        return part_name
+    return posixpath.relpath(part_name, posixpath.dirname(source_part))
+
+
+def _next_ooxml_media_part_name(existing_names, original_part_name):
+    dirname = posixpath.dirname(original_part_name)
+    stem = posixpath.splitext(posixpath.basename(original_part_name))[0]
+    candidate = posixpath.join(dirname, f"{stem}.jpg")
+    if candidate not in existing_names:
+        return candidate
+
+    index = 1
+    while True:
+        candidate = posixpath.join(dirname, f"{stem}_{index}.jpg")
+        if candidate not in existing_names:
+            return candidate
+        index += 1
+
+
+def _rewrite_zip_package(package_path, replacements, removals=()):
+    output_dir = os.path.dirname(os.path.abspath(package_path)) or "."
+    suffix = os.path.splitext(package_path)[1]
+    fd, temp_path = tempfile.mkstemp(suffix=suffix, dir=output_dir)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(package_path, "r") as source_zip, zipfile.ZipFile(
+            temp_path, "w", zipfile.ZIP_DEFLATED
+        ) as target_zip:
+            replaced_names = set(replacements)
+            removed_names = set(removals)
+            for item in source_zip.infolist():
+                if item.filename in replaced_names or item.filename in removed_names:
+                    continue
+                target_zip.writestr(item, source_zip.read(item.filename))
+            for name, data in replacements.items():
+                target_zip.writestr(name, data)
+        os.replace(temp_path, package_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
+def optimize_ooxml_images(package_path, media_prefix, rels_prefix, quality=80):
+    with zipfile.ZipFile(package_path, "r") as package_zip:
+        existing_names = set(package_zip.namelist())
+        media_names = [
+            name
+            for name in existing_names
+            if name.startswith(media_prefix) and not name.endswith("/")
+        ]
+        content_types_root = _load_ooxml_xml_part(
+            package_zip,
+            "[Content_Types].xml",
+            ET.Element(f"{{{_OOXML_CONTENT_TYPES_NS}}}Types"),
+        )
+        rels_parts = {}
+        for name in existing_names:
+            if not name.endswith(".rels"):
+                continue
+            if rels_prefix and not name.startswith(rels_prefix):
+                continue
+            try:
+                rels_parts[name] = ET.fromstring(package_zip.read(name))
+            except ET.ParseError:
+                continue
+        media_data = {name: package_zip.read(name) for name in media_names}
+
+    replacements = {}
+    removals = set()
+    optimized_parts = {}
+    renamed_parts = {}
+    reserved_names = set(existing_names)
+
+    for media_name, image_data in media_data.items():
+        jpeg_data = image_data_to_jpeg_bytes(image_data, quality=quality)
+        if not jpeg_data or len(jpeg_data) >= len(image_data):
+            continue
+
+        extension = posixpath.splitext(media_name)[1].lower()
+        if extension in (".jpg", ".jpeg"):
+            new_name = media_name
+        else:
+            new_name = _next_ooxml_media_part_name(reserved_names, media_name)
+            reserved_names.add(new_name)
+            removals.add(media_name)
+            renamed_parts[media_name] = new_name
+
+        replacements[new_name] = jpeg_data
+        optimized_parts[media_name] = new_name
+
+    if not optimized_parts:
+        return {}
+
+    for rels_name, rels_root in rels_parts.items():
+        changed = False
+        for rel in rels_root.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship"):
+            if (
+                rel.get("Type") != _OOXML_IMAGE_REL_TYPE
+                or rel.get("TargetMode") == "External"
+            ):
+                continue
+            old_part_name = _ooxml_relationship_target_part(
+                rels_name, rel.get("Target", "")
+            )
+            if old_part_name not in renamed_parts:
+                continue
+            rel.set(
+                "Target",
+                _ooxml_relationship_target_for_part(
+                    rels_name, renamed_parts[old_part_name]
+                ),
+            )
+            changed = True
+        if changed:
+            replacements[rels_name] = _ooxml_xml_bytes(
+                rels_root, default_namespace=_OOXML_PACKAGE_REL_NS
+            )
+
+    _ensure_ooxml_content_type_default(content_types_root, "jpg", "image/jpeg")
+    _ensure_ooxml_content_type_default(content_types_root, "jpeg", "image/jpeg")
+    for old_part_name in renamed_parts:
+        _remove_ooxml_content_type_override(content_types_root, f"/{old_part_name}")
+    replacements["[Content_Types].xml"] = _ooxml_xml_bytes(
+        content_types_root, default_namespace=_OOXML_CONTENT_TYPES_NS
+    )
+
+    _rewrite_zip_package(package_path, replacements, removals=removals)
+    return optimized_parts
 
 
 class DummyLogger(object):
