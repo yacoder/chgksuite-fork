@@ -1,5 +1,4 @@
 import os
-import posixpath
 import re
 import shlex
 import shutil
@@ -23,8 +22,8 @@ from docx.shared import Pt as DocxPt
 import chgksuite.typotools as typotools
 from chgksuite.common import (
     DummyLogger,
-    image_data_to_jpeg_bytes,
     log_wrap,
+    optimize_ooxml_images,
     replace_escaped,
 )
 from chgksuite.composer.composer_common import (
@@ -58,9 +57,6 @@ _CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-type
 _PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-_IMAGE_REL_TYPE = (
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
-)
 _FONT_EMBED_TAGS = {
     "regular": "embedRegular",
     "bold": "embedBold",
@@ -493,137 +489,13 @@ def _font_elements(font_table_root, font_name):
 
 
 def _optimize_size_enabled(args):
-    return getattr(args, "optimize_size", "on") == "on"
-
-
-def _ensure_content_type_default(content_types_root, extension, content_type):
-    for default in content_types_root.findall(f"{{{_CONTENT_TYPES_NS}}}Default"):
-        if default.get("Extension") == extension:
-            default.set("ContentType", content_type)
-            return
-    default = ET.Element(
-        f"{{{_CONTENT_TYPES_NS}}}Default",
-        {"Extension": extension, "ContentType": content_type},
-    )
-    insert_at = 0
-    for index, child in enumerate(list(content_types_root)):
-        if child.tag == f"{{{_CONTENT_TYPES_NS}}}Override":
-            insert_at = index
-            break
-        insert_at = index + 1
-    content_types_root.insert(insert_at, default)
-
-
-def _remove_content_type_override(content_types_root, part_name):
-    for override in list(content_types_root.findall(f"{{{_CONTENT_TYPES_NS}}}Override")):
-        if override.get("PartName") == part_name:
-            content_types_root.remove(override)
-
-
-def _rels_source_part(rels_part_name):
-    rels_dir = posixpath.dirname(rels_part_name)
-    if posixpath.basename(rels_dir) != "_rels":
-        return None
-    source_dir = posixpath.dirname(rels_dir)
-    source_name = posixpath.basename(rels_part_name)[: -len(".rels")]
-    return posixpath.join(source_dir, source_name)
-
-
-def _relationship_target_part(rels_part_name, target):
-    source_part = _rels_source_part(rels_part_name)
-    if source_part is None:
-        return None
-    return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
-
-
-def _relationship_target_for_part(rels_part_name, part_name):
-    source_part = _rels_source_part(rels_part_name)
-    if source_part is None:
-        return part_name
-    return posixpath.relpath(part_name, posixpath.dirname(source_part))
-
-
-def _next_media_part_name(existing_names, original_part_name):
-    dirname = posixpath.dirname(original_part_name)
-    stem = posixpath.splitext(posixpath.basename(original_part_name))[0]
-    candidate = posixpath.join(dirname, f"{stem}.jpg")
-    if candidate not in existing_names:
-        return candidate
-
-    index = 1
-    while True:
-        candidate = posixpath.join(dirname, f"{stem}_{index}.jpg")
-        if candidate not in existing_names:
-            return candidate
-        index += 1
+    return (getattr(args, "optimize_size", None) or "on") == "on"
 
 
 def optimize_docx_images(docx_path, quality=80):
-    with zipfile.ZipFile(docx_path, "r") as docx_zip:
-        existing_names = set(docx_zip.namelist())
-        media_names = [
-            name
-            for name in existing_names
-            if name.startswith("word/media/") and not name.endswith("/")
-        ]
-        content_types_root = _load_xml_part(
-            docx_zip,
-            "[Content_Types].xml",
-            ET.Element(f"{{{_CONTENT_TYPES_NS}}}Types"),
-        )
-        rels_parts = {
-            name: ET.fromstring(docx_zip.read(name))
-            for name in existing_names
-            if name.startswith("word/_rels/") and name.endswith(".rels")
-        }
-        media_data = {name: docx_zip.read(name) for name in media_names}
-
-    replacements = {}
-    removals = set()
-    renamed_parts = {}
-    reserved_names = set(existing_names)
-
-    for media_name, image_data in media_data.items():
-        jpeg_data = image_data_to_jpeg_bytes(image_data, quality=quality)
-        if not jpeg_data:
-            continue
-        new_name = _next_media_part_name(reserved_names, media_name)
-        reserved_names.add(new_name)
-        replacements[new_name] = jpeg_data
-        removals.add(media_name)
-        renamed_parts[media_name] = new_name
-
-    if not renamed_parts:
-        return {}
-
-    for rels_name, rels_root in rels_parts.items():
-        changed = False
-        for rel in rels_root.findall(f"{{{_PACKAGE_REL_NS}}}Relationship"):
-            if rel.get("Type") != _IMAGE_REL_TYPE or rel.get("TargetMode") == "External":
-                continue
-            old_part_name = _relationship_target_part(rels_name, rel.get("Target", ""))
-            if old_part_name not in renamed_parts:
-                continue
-            rel.set(
-                "Target",
-                _relationship_target_for_part(rels_name, renamed_parts[old_part_name]),
-            )
-            changed = True
-        if changed:
-            replacements[rels_name] = _xml_bytes(
-                rels_root, default_namespace=_PACKAGE_REL_NS
-            )
-
-    _ensure_content_type_default(content_types_root, "jpg", "image/jpeg")
-    _ensure_content_type_default(content_types_root, "jpeg", "image/jpeg")
-    for old_part_name in renamed_parts:
-        _remove_content_type_override(content_types_root, f"/{old_part_name}")
-    replacements["[Content_Types].xml"] = _xml_bytes(
-        content_types_root, default_namespace=_CONTENT_TYPES_NS
+    return optimize_ooxml_images(
+        docx_path, media_prefix="word/media/", rels_prefix="word/", quality=quality
     )
-
-    _rewrite_docx_package(docx_path, replacements, removals=removals)
-    return renamed_parts
 
 
 def collect_docx_used_characters(docx_path):

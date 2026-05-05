@@ -4,6 +4,7 @@ import contextlib
 import inspect
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -963,7 +964,15 @@ def test_optimize_docx_images_recompresses_png_as_jpeg(tmp_path):
     from docx import Document
 
     image_path = tmp_path / "source.png"
-    Image.new("RGBA", (50, 50), (255, 0, 0, 128)).save(image_path)
+    rng = random.Random(0)
+    image = Image.new("RGB", (180, 180))
+    image.putdata(
+        [
+            (rng.randrange(256), rng.randrange(256), rng.randrange(256))
+            for _ in range(180 * 180)
+        ]
+    )
+    image.save(image_path)
     docx_path = tmp_path / "image.docx"
     doc = Document()
     doc.add_picture(str(image_path))
@@ -1054,6 +1063,16 @@ def test_docx_cli_accepts_font_and_embed_fonts():
     assert args.optimize_size == "on"
     assert legacy_args.font == "Legacy Font"
     assert legacy_args.optimize_size == "off"
+
+    pptx_args = parser.parse_args(
+        ["compose", "pptx", "--font", "Test PPT", "test.4s"]
+    )
+    pptx_no_optimize_args = parser.parse_args(
+        ["compose", "pptx", "--optimize_size", "off", "test.4s"]
+    )
+    assert pptx_args.font == "Test PPT"
+    assert pptx_args.optimize_size == "on"
+    assert pptx_no_optimize_args.optimize_size == "off"
 
 
 def test_telegram_formats_non_ascii_url_as_html_link():
