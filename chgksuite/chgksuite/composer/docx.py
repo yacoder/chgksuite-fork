@@ -69,6 +69,7 @@ _WORD_TEXT_TAGS = {
     f"{{{_W_NS}}}delText",
     f"{{{_W_NS}}}instrText",
 }
+_DOCX_NO_BREAK_HYPHEN_REPLACEMENT = "\u2060-\u2060"
 
 ET.register_namespace("w", _W_NS)
 ET.register_namespace("r", _R_NS)
@@ -758,9 +759,21 @@ def remove_square_brackets_standalone(s, regexes):
     return s
 
 
+def set_docx_run_text(run, text):
+    """Set run text with LibreOffice-safe non-breaking hyphens."""
+    text = str(text).replace("\u2011", _DOCX_NO_BREAK_HYPHEN_REPLACEMENT)
+    run.text = text
+    return run
+
+
+def add_text_run_to_docx(paragraph, text):
+    run = paragraph.add_run()
+    return set_docx_run_text(run, text)
+
+
 def add_hyperlink_to_docx(doc, paragraph, text, url):
     """Standalone version of add_hyperlink"""
-    run = paragraph.add_run(text)
+    run = add_text_run_to_docx(paragraph, text)
     run.style = doc.styles["Hyperlink"]
     part = paragraph.part
     r_id = part.relate_to(
@@ -898,7 +911,7 @@ def format_docx_element(
                     text = run[1]["for_print"]
                 if replace_no_break_spaces:
                     text = replace_no_break_standalone(text)
-                r = para.add_run(text)
+                r = add_text_run_to_docx(para, text)
             elif run[0] == "hyperlink" and not (whiten and spoilers == "whiten"):
                 r = add_hyperlink_to_docx(doc, para, run[1], run[1])
             elif run[0] == "img":
@@ -948,7 +961,7 @@ def format_docx_element(
                 text = run[1]
                 if replace_no_break_spaces:
                     text = replace_no_break_standalone(text)
-                r = para.add_run(text)
+                r = add_text_run_to_docx(para, text)
                 if "italic" in run[0]:
                     r.italic = True
                 if "bold" in run[0]:

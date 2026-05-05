@@ -1,4 +1,6 @@
 import copy
+import functools
+import math
 import os
 import re
 import struct
@@ -70,10 +72,19 @@ _PPTX_PRESENTATION_INSERT_BEFORE = {
     f"{{{_P_NS}}}extLst",
 }
 _PPTX_TEXT_TAGS = {f"{{{_A_NS}}}t"}
+_PPTX_URL_BREAK_AFTER_CHARS = "/.-_\u2011?&=%#:"
+_PPTX_URL_RE = re.compile(r"https?://|www\.")
 
 ET.register_namespace("a", _A_NS)
 ET.register_namespace("p", _P_NS)
 ET.register_namespace("r", _R_NS)
+
+
+@functools.lru_cache(maxsize=256)
+def _pillow_font(font_path, pixel_size):
+    from PIL import ImageFont
+
+    return ImageFont.truetype(font_path, size=pixel_size)
 
 
 def _optimize_size_enabled(args):
@@ -710,27 +721,57 @@ class PptxExporter(BaseExporter):
         return self._get_font_size("tour_size", 42)
 
     def _get_measurement_font_path(self):
-        if self.font_faces and self.font_faces.get("regular"):
-            return self.font_faces["regular"].path
-        if not self.font_spec:
+        faces = self._get_measurement_font_faces()
+        face = faces.get("regular")
+        return getattr(face, "path", None) if face else None
+
+    def _get_measurement_font_faces(self):
+        if self.font_faces:
+            return self.font_faces
+
+        font_spec = self.font_spec or self.c.get("font", {}).get("name")
+        if not font_spec:
+            return {}
+        if self._measurement_font_faces is not None:
+            return self._measurement_font_faces
+        try:
+            self._measurement_font_faces = _select_font_faces(font_spec)
+        except (OSError, PermissionError, ValueError):
+            self._measurement_font_faces = {}
+        return self._measurement_font_faces
+
+    def _get_measurement_font_path_for_style(self, bold=False, italic=False):
+        faces = self._get_measurement_font_faces()
+        if not faces:
             return None
-        if self._measurement_font_faces is None:
-            try:
-                self._measurement_font_faces = _select_font_faces(self.font_spec)
-            except (OSError, PermissionError, ValueError):
-                self._measurement_font_faces = {}
-        face = self._measurement_font_faces.get("regular")
-        return face.path if face else None
+        if bold and italic:
+            face = faces.get("bold_italic") or faces.get("bold") or faces.get("italic")
+        elif bold:
+            face = faces.get("bold")
+        elif italic:
+            face = faces.get("italic")
+        else:
+            face = faces.get("regular")
+        face = face or faces.get("regular") or next(iter(faces.values()))
+        return getattr(face, "path", None) if face else None
+
+    def _font_pixel_size(self, font_size):
+        return max(1, round(float(font_size) * _PX_PER_INCH / _PT_PER_INCH))
 
     def _measure_text_width_px(self, font_path, text, font_size):
-        from PIL import ImageFont
-
-        pixel_size = max(1, round(float(font_size) * _PX_PER_INCH / _PT_PER_INCH))
-        font = ImageFont.truetype(font_path, size=pixel_size)
+        font = _pillow_font(font_path, self._font_pixel_size(font_size))
         if hasattr(font, "getlength"):
             return font.getlength(text)
         bbox = font.getbbox(text)
         return bbox[2] - bbox[0]
+
+    def _measure_line_height_px(self, font_path, font_size):
+        font = _pillow_font(font_path, self._font_pixel_size(font_size))
+        height = getattr(getattr(font, "font", None), "height", None)
+        if height:
+            return height
+        ascent, descent = font.getmetrics()
+        return ascent + descent
 
     def _textbox_inner_width_px(self, textbox):
         text_frame = textbox.text_frame
@@ -738,6 +779,241 @@ class PptxExporter(BaseExporter):
         margin_right = text_frame.margin_right or 0
         inner_width = max(textbox.width - margin_left - margin_right, 1)
         return inner_width / _EMU_PER_INCH * _PX_PER_INCH
+
+    def _textbox_inner_height_px(self, textbox):
+        text_frame = textbox.text_frame
+        margin_top = text_frame.margin_top or 0
+        margin_bottom = text_frame.margin_bottom or 0
+        inner_height = max(textbox.height - margin_top - margin_bottom, 1)
+        return inner_height / _EMU_PER_INCH * _PX_PER_INCH
+
+    def _pt_to_px(self, value):
+        return float(value) * _PX_PER_INCH / _PT_PER_INCH
+
+    def _length_to_px(self, value):
+        if value is None:
+            return 0
+        return value / _EMU_PER_INCH * _PX_PER_INCH
+
+    def _effective_paragraph_size(self, paragraph):
+        if paragraph.font.size:
+            return paragraph.font.size.pt
+        return self._get_font_size("default_size", 32)
+
+    def _effective_run_size(self, run, paragraph):
+        if run.font.size:
+            return run.font.size.pt
+        return self._effective_paragraph_size(paragraph)
+
+    def _run_text_width_px(self, run, paragraph, text=None):
+        text = run.text if text is None else text
+        if not text:
+            return 0
+        font_path = self._get_measurement_font_path_for_style(
+            bold=bool(run.font.bold), italic=bool(run.font.italic)
+        )
+        if not font_path:
+            return None
+        return self._measure_text_width_px(
+            font_path, text, self._effective_run_size(run, paragraph)
+        )
+
+    def _run_line_height_px(self, run, paragraph):
+        font_path = self._get_measurement_font_path_for_style(
+            bold=bool(run.font.bold), italic=bool(run.font.italic)
+        )
+        if not font_path:
+            return self._pt_to_px(self._effective_run_size(run, paragraph))
+        return self._measure_line_height_px(
+            font_path, self._effective_run_size(run, paragraph)
+        )
+
+    def _text_width_px(self, text, size, bold=False, italic=False):
+        if not text:
+            return 0
+        font_path = self._get_measurement_font_path_for_style(
+            bold=bold, italic=italic
+        )
+        if not font_path:
+            return None
+        return self._measure_text_width_px(font_path, text, size)
+
+    def _token_width_px(self, paragraph, runs):
+        total = 0
+        for run, text in runs:
+            width = self._run_text_width_px(run, paragraph, text=text)
+            if width is None:
+                return None
+            total += width
+        return total
+
+    def _run_can_break_like_url(self, run, text):
+        hyperlink = getattr(run, "hyperlink", None)
+        if hyperlink is not None and getattr(hyperlink, "address", None):
+            return True
+        return bool(_PPTX_URL_RE.search(text))
+
+    def _append_url_wrapping_tokens(self, line, run, text):
+        token = ""
+        for char in text:
+            token += char
+            if char in _PPTX_URL_BREAK_AFTER_CHARS:
+                line.append((run, token, False))
+                line.append((run, "", True))
+                token = ""
+        if token:
+            line.append((run, token, False))
+
+    def _split_runs_for_wrapping(self, paragraph):
+        lines = [[]]
+        runs_by_element = {id(run._r): run for run in paragraph.runs}
+
+        def append_text(run, text):
+            for line_index, line in enumerate(re.split(r"[\n\r\v]", text)):
+                if line_index:
+                    lines.append([])
+                parts = re.split(r"( +)", line)
+                for part in parts:
+                    if not part:
+                        continue
+                    if part.isspace() and "\u00a0" not in part and "\u2011" not in part:
+                        lines[-1].append((run, part, True))
+                    elif self._run_can_break_like_url(run, part):
+                        self._append_url_wrapping_tokens(lines[-1], run, part)
+                    else:
+                        lines[-1].append((run, part, False))
+
+        for child in paragraph._p:
+            if child.tag.endswith("}br"):
+                lines.append([])
+                continue
+            if not child.tag.endswith("}r"):
+                continue
+            run = runs_by_element.get(id(child))
+            if run is None:
+                continue
+            append_text(run, run.text)
+        return lines
+
+    def _paragraph_layout_lines(self, paragraph, max_width):
+        lines = []
+        max_unbreakable_width = 0
+        for explicit_line in self._split_runs_for_wrapping(paragraph):
+            if not explicit_line:
+                lines.append([])
+                continue
+
+            current_line = []
+            current_width = 0
+            pending_spaces = []
+            has_content = False
+
+            for run, text, breakable_space in explicit_line:
+                token_width = self._token_width_px(paragraph, [(run, text)])
+                if token_width is None:
+                    return None
+                if breakable_space:
+                    pending_spaces.append((run, text))
+                    continue
+
+                space_width = self._token_width_px(paragraph, pending_spaces)
+                if space_width is None:
+                    return None
+                candidate_width = current_width + space_width + token_width
+                max_unbreakable_width = max(max_unbreakable_width, token_width)
+                if has_content and candidate_width > max_width:
+                    lines.append(current_line)
+                    current_line = [(run, text)]
+                    current_width = token_width
+                else:
+                    current_line.extend(pending_spaces)
+                    current_line.append((run, text))
+                    current_width = candidate_width
+                pending_spaces = []
+                has_content = True
+
+            lines.append(current_line)
+
+        return lines, max_unbreakable_width
+
+    def _paragraph_line_count(self, paragraph, max_width):
+        layout = self._paragraph_layout_lines(paragraph, max_width)
+        if layout is None:
+            return None
+        lines, max_unbreakable_width = layout
+        return len(lines), max_unbreakable_width
+
+    def _paragraph_line_height_px(self, paragraph, line_runs=None):
+        text_runs = [(run, text) for run, text in line_runs or [] if text]
+        if text_runs:
+            line_height = max(
+                self._run_line_height_px(run, paragraph) for run, _text in text_runs
+            )
+            font_size = max(
+                self._effective_run_size(run, paragraph) for run, _text in text_runs
+            )
+        else:
+            font_size = self._effective_paragraph_size(paragraph)
+            font_path = self._get_measurement_font_path_for_style()
+            if font_path:
+                line_height = self._measure_line_height_px(font_path, font_size)
+            else:
+                line_height = self._pt_to_px(font_size)
+        line_spacing = paragraph.line_spacing
+        if line_spacing is None:
+            return line_height
+        if isinstance(line_spacing, float):
+            return line_height * line_spacing
+        return self._length_to_px(line_spacing)
+
+    def _text_frame_fits(self, textbox):
+        max_width = self._textbox_inner_width_px(textbox) * 0.99
+        max_height = self._textbox_inner_height_px(textbox) * 0.99
+        total_height = 0
+        for paragraph in textbox.text_frame.paragraphs:
+            line_info = self._paragraph_layout_lines(paragraph, max_width)
+            if line_info is None:
+                return True
+            lines, max_unbreakable_width = line_info
+            if max_unbreakable_width > max_width:
+                return False
+            for line_runs in lines:
+                total_height += self._paragraph_line_height_px(paragraph, line_runs)
+            total_height += self._length_to_px(paragraph.space_after)
+            total_height += self._length_to_px(paragraph.space_before)
+        return total_height <= max_height
+
+    def _collect_textbox_font_sizes(self, textbox):
+        items = []
+        fallback = self._get_font_size("default_size", 32)
+        for paragraph in textbox.text_frame.paragraphs:
+            paragraph_size = paragraph.font.size.pt if paragraph.font.size else fallback
+            items.append((paragraph.font, paragraph_size))
+            for run in paragraph.runs:
+                run_size = run.font.size.pt if run.font.size else paragraph_size
+                items.append((run.font, run_size))
+        return items
+
+    def _set_textbox_font_delta(self, items, delta, min_size):
+        for font, original_size in items:
+            font.size = PptxPt(max(float(min_size), float(original_size) - delta))
+
+    def _custom_shrink_textbox(self, textbox, min_size=None):
+        if self._disable_shrink_fit():
+            return
+        if not self._get_measurement_font_faces():
+            return
+        items = self._collect_textbox_font_sizes(textbox)
+        if not items:
+            return
+        min_size = min_size or self.c.get("text_size_grid", {}).get("smallest", 14)
+        max_delta = max(
+            0, math.ceil(max(original_size for _font, original_size in items) - min_size)
+        )
+        for delta in range(max_delta + 1):
+            self._set_textbox_font_delta(items, delta, min_size)
+            if self._text_frame_fits(textbox):
+                return
 
     def _plain_text_lines_for_measurement(self, text):
         lines = [""]
@@ -805,13 +1081,7 @@ class PptxExporter(BaseExporter):
 
     def _prepare_text_frame(self, text_frame):
         text_frame.word_wrap = True
-        if self._disable_shrink_fit():
-            text_frame.auto_size = MSO_AUTO_SIZE.NONE
-            return
-        text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        autofit = text_frame._txBody.bodyPr.normAutofit
-        if autofit is not None and self._line_spacing_configured():
-            autofit.set("lnSpcReduction", "0")
+        text_frame.auto_size = MSO_AUTO_SIZE.NONE
 
     def _remove_shape(self, shape):
         element = shape._element
@@ -1061,6 +1331,7 @@ class PptxExporter(BaseExporter):
             tf.margin_top = 0
             tf.margin_bottom = 0
             tf.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
+            self._custom_shrink_textbox(title)
         elif hasattr(subtitle, "text_frame"):
             self._prepare_text_frame(subtitle.text_frame)
             self._apply_font_size_to_text_frame(
@@ -1068,6 +1339,7 @@ class PptxExporter(BaseExporter):
                 self._get_font_size("default_size", 32),
                 line_spacing_key="default",
             )
+            self._custom_shrink_textbox(subtitle)
 
     def _process_block(self, block):
         section = [x for x in block if x[0] == "section"]
@@ -1118,6 +1390,7 @@ class PptxExporter(BaseExporter):
                     slide,
                 )
                 add_line_break = True
+        self._custom_shrink_textbox(textbox)
 
     def process_buffer(self, buffer):
         heading_block = []
@@ -1436,6 +1709,7 @@ class PptxExporter(BaseExporter):
                 line_spacing_key="question",
             )
         self.pptx_format(question_text, p, tf, slide, blank_lines_between_items=True)
+        self._custom_shrink_textbox(textbox)
 
     def recursive_join(self, s):
         if isinstance(s, str):
@@ -1460,6 +1734,7 @@ class PptxExporter(BaseExporter):
         )
         self._set_paragraph_alignment(p, handout_cfg.get("align"))
         self.pptx_format(handout_text, p, tf, slide)
+        self._custom_shrink_textbox(textbox)
 
     def process_question_text(self, q):
         image = self._get_image_from_4s(q["question"])
@@ -1554,6 +1829,7 @@ class PptxExporter(BaseExporter):
             r = self.add_run(p, f"\n{self.get_label(q, 'author')}: ")
             r.font.bold = True
             self.pptx_format(author_text, p, tf, slide)
+        self._custom_shrink_textbox(textbox)
 
     def process_question(self, q):
         if "number" not in q:

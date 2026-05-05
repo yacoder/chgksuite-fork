@@ -33,6 +33,7 @@ from chgksuite.composer.composer_common import (
 from chgksuite.composer.docx import (
     DocxExporter,
     add_hyperlink_to_docx,
+    add_text_run_to_docx,
     embed_fonts_in_docx,
     optimize_docx_images,
     remove_square_brackets_standalone,
@@ -47,7 +48,7 @@ from chgksuite.parser import (
     troika_parse_docx,
     troika_parse_text,
 )
-from chgksuite.typotools import get_quotes_right, cyr_lat_check_word
+from chgksuite.typotools import cyr_lat_check_word, get_quotes_right, replace_no_break
 from PIL import Image
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -130,6 +131,15 @@ QUOTE_TEST_CASES = [
 @pytest.mark.parametrize("a,expected", QUOTE_TEST_CASES)
 def test_quotes(a, expected):
     assert get_quotes_right(a) == expected
+
+
+def test_replace_no_break_preserves_url_hyphens():
+    url = "https://example.com/history/160517-nilometer-discovered/ик-с"
+    result = replace_no_break(f"Ссылка на {url}; код И-К-Б-С.")
+
+    assert url in result
+    assert f"на\u00a0{url}" in result
+    assert "И\u2011К\u2011Б\u2011С" in result
 
 
 # Test cases for Latin accented character conversion to Cyrillic
@@ -821,6 +831,23 @@ def test_docx_hyperlink_targets_percent_encode_non_ascii_url(tmp_path):
     assert "%E2%80%94" in target
     assert not re.search(r"[А-Яа-яЁё«»—]", target)
     assert url in document
+
+
+def test_docx_non_breaking_hyphen_uses_word_joiners(tmp_path):
+    from docx import Document
+
+    doc = Document()
+    paragraph = doc.add_paragraph()
+    add_text_run_to_docx(paragraph, "В 50\u2011е годы")
+    filename = tmp_path / "nbh.docx"
+    doc.save(filename)
+
+    with zipfile.ZipFile(filename) as docx_file:
+        document = docx_file.read("word/document.xml").decode("utf-8")
+
+    assert "<w:noBreakHyphen/>" not in document
+    assert "\u2011" not in document
+    assert "В 50\u2060-\u2060е годы" in document
 
 
 def _write_test_ttf(
