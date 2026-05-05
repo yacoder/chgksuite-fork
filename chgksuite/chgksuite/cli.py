@@ -705,6 +705,16 @@ class ArgparseBuilder:
         )
         self.add_argument(
             cmdcompose_pptx,
+            "--embed_fonts",
+            choices=["on", "off"],
+            default=default_overrides.get("embed_fonts") or "off",
+            help="embed the selected --font in the PPTX file.",
+            advanced=True,
+            caption="Встроить шрифт",
+            argtype="radiobutton",
+        )
+        self.add_argument(
+            cmdcompose_pptx,
             "--do_dot_remove_accents",
             help="do not remove accents.",
             advanced=True,

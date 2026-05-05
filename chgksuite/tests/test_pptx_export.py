@@ -1,17 +1,20 @@
 from io import BytesIO
 from pathlib import Path
 import random
+import urllib.parse
 import zipfile
 
 import toml
 from PIL import Image
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.enum.text import MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
 
 from chgksuite.common import DefaultArgs
+from chgksuite.composer.docx import _HYPERLINK_SAFE_CHARS
 from chgksuite.composer.pptx import PptxExporter, optimize_pptx_images
 
 
@@ -43,7 +46,9 @@ def _config_path(tmp_path, updates=None):
     return str(path)
 
 
-def _pptx_args(tmp_path, font=None, config_updates=None, optimize_size=None):
+def _pptx_args(
+    tmp_path, font=None, config_updates=None, optimize_size=None, embed_fonts=None
+):
     args = DefaultArgs(
         pptx_config=_config_path(tmp_path, config_updates),
         labels_file=str(RESOURCES / "labels_ru.toml"),
@@ -55,11 +60,40 @@ def _pptx_args(tmp_path, font=None, config_updates=None, optimize_size=None):
     )
     if optimize_size is not None:
         args.optimize_size = optimize_size
+    if embed_fonts is not None:
+        args.embed_fonts = embed_fonts
     return args
 
 
 def _export_pptx(
-    tmp_path, structure, font=None, config_updates=None, optimize_size=None
+    tmp_path,
+    structure,
+    font=None,
+    config_updates=None,
+    optimize_size=None,
+    embed_fonts=None,
+):
+    return Presentation(
+        str(
+            _export_pptx_path(
+                tmp_path,
+                structure,
+                font=font,
+                config_updates=config_updates,
+                optimize_size=optimize_size,
+                embed_fonts=embed_fonts,
+            )
+        )
+    )
+
+
+def _export_pptx_path(
+    tmp_path,
+    structure,
+    font=None,
+    config_updates=None,
+    optimize_size=None,
+    embed_fonts=None,
 ):
     outfilename = tmp_path / "out.pptx"
     exporter = PptxExporter(
@@ -69,11 +103,12 @@ def _export_pptx(
             font=font,
             config_updates=config_updates,
             optimize_size=optimize_size,
+            embed_fonts=embed_fonts,
         ),
         {"tmp_dir": str(tmp_path), "targetdir": str(tmp_path)},
     )
     exporter.export(str(outfilename))
-    return Presentation(str(outfilename))
+    return outfilename
 
 
 def _write_noisy_png(path):
@@ -218,6 +253,129 @@ def test_pptx_exporter_can_disable_size_optimization(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_pptx_exporter_embeds_fonts_when_enabled(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_embed(pptx_path, font_spec, **kwargs):
+        calls.append((Path(pptx_path).name, font_spec, kwargs))
+        return {}
+
+    monkeypatch.setattr(
+        "chgksuite.composer.pptx._select_font_faces",
+        lambda font_spec: {"regular": SimpleNamespace(family="Test Embed")},
+    )
+    monkeypatch.setattr("chgksuite.composer.pptx.embed_fonts_in_pptx", fake_embed)
+    _export_pptx(
+        tmp_path,
+        [("Question", {"question": "Question AB", "answer": "Answer."})],
+        font="Test Embed",
+        embed_fonts="on",
+    )
+
+    assert calls
+    _, font_spec, kwargs = calls[0]
+    assert font_spec == "Test Embed"
+    assert kwargs["font_name"] == "Test Embed"
+    assert {"A", "B"}.issubset(kwargs["subset_characters"])
+
+
+def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
+    url = "https://example.com/привет?q=тест"
+    encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+    pptx_path = _export_pptx_path(
+        tmp_path,
+        [
+            (
+                "Question",
+                {
+                    "question": f"Ссылка: {url}.",
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+    )
+    prs = Presentation(str(pptx_path))
+
+    link_runs = [
+        run
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame")
+        for paragraph in shape.text_frame.paragraphs
+        for run in paragraph.runs
+        if run.text == url
+    ]
+
+    assert len(link_runs) == 1
+    assert link_runs[0].hyperlink.address == encoded_url
+    assert link_runs[0].font.underline is True
+    assert link_runs[0].font.color.rgb == RGBColor(0x05, 0x63, 0xC1)
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        slide_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        )
+        rels_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/_rels/") and name.endswith(".rels")
+        )
+
+    assert '<a:hlinkClick r:id="' in slide_xml
+    assert 'u="sng"' in slide_xml
+    assert 'val="0563C1"' in slide_xml
+    assert 'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"' in rels_xml
+    assert f'Target="{encoded_url}"' in rels_xml
+    assert 'TargetMode="External"' in rels_xml
+
+
+def test_pptx_block_metadata_hyperlinks_are_clickable_and_styled(tmp_path):
+    url = "https://gotquestions.online"
+    pptx_path = _export_pptx_path(
+        tmp_path,
+        [
+            ("heading", "Тестовый пакет"),
+            ("section", "Тур 1"),
+            ("meta", f"Срок незасветки пакета — до публикации на {url}."),
+            ("Question", {"question": "Вопрос.", "answer": "Ответ."}),
+        ],
+    )
+    prs = Presentation(str(pptx_path))
+
+    link_runs = [
+        run
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame")
+        for paragraph in shape.text_frame.paragraphs
+        for run in paragraph.runs
+        if run.text == url
+    ]
+
+    assert len(link_runs) == 1
+    assert link_runs[0].hyperlink.address == url
+    assert link_runs[0].font.underline is True
+    assert link_runs[0].font.color.rgb == RGBColor(0x05, 0x63, 0xC1)
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        rels_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/_rels/") and name.endswith(".rels")
+        )
+
+    assert (
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/hyperlink"'
+    ) in rels_xml
+    assert f'Target="{url}"' in rels_xml
+    assert 'TargetMode="External"' in rels_xml
+
+
 def test_title_slide_uses_full_height_centered_textbox(tmp_path):
     prs = _export_pptx(
         tmp_path,
@@ -240,6 +398,65 @@ def test_title_slide_uses_full_height_centered_textbox(tmp_path):
     assert round(title.width / 914400, 2) == 10.5
     assert [run.font.size.pt for run in title.text_frame.paragraphs[0].runs] == [60.0]
     assert not any(shape.name.startswith("Subtitle") for shape in prs.slides[0].shapes)
+
+
+def test_default_pptx_template_uses_larger_tour_and_handout_fonts(tmp_path):
+    prs = _export_pptx(
+        tmp_path,
+        [
+            ("heading", "Тестовый пакет"),
+            ("section", "Тур 1"),
+            (
+                "Question",
+                {
+                    "question": "[Раздаточный материал: Текст раздатки]\nВопрос?",
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+    )
+
+    tour_shape = next(
+        shape
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame") and shape.text.strip() == "Тур 1"
+    )
+    handout_shape = next(
+        shape
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame") and shape.text.strip() == "Текст раздатки"
+    )
+
+    assert {
+        run.font.size.pt
+        for run in tour_shape.text_frame.paragraphs[0].runs
+        if run.text.strip()
+    } == {42.0}
+    assert {
+        run.font.size.pt
+        for run in handout_shape.text_frame.paragraphs[0].runs
+        if run.text.strip()
+    } == {42.0}
+
+    question_shape = next(
+        shape
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame") and "Вопрос?" in shape.text
+    )
+    handout_paragraph = question_shape.text_frame.paragraphs[0]
+    question_paragraph = question_shape.text_frame.paragraphs[1]
+
+    assert handout_paragraph.text == "Текст раздатки"
+    assert {
+        run.font.size.pt for run in handout_paragraph.runs if run.text.strip()
+    } == {42.0}
+    assert question_paragraph.text == "Вопрос?"
+    assert {
+        run.font.size.pt for run in question_paragraph.runs if run.text.strip()
+    } == {32.0}
 
 
 def test_service_slides_are_inserted_from_template(tmp_path):
@@ -357,14 +574,16 @@ def test_pptx_textboxes_shrink_text_and_stamp_run_sizes(tmp_path):
     assert "<a:lnSpc>" not in textbox.element.txBody.xml
     assert "<a:spAutoFit" not in textbox.element.txBody.xml
 
-    run_sizes = [
-        run.font.size.pt
+    runs = [
+        run
         for paragraph in textbox.text_frame.paragraphs
         for run in paragraph.runs
         if run.text.strip()
     ]
+    run_sizes = [run.font.size.pt for run in runs]
     assert run_sizes
-    assert set(run_sizes) == {32.0}
+    assert {run.font.size.pt for run in runs if "Тур 2" in run.text} == {42.0}
+    assert {run.font.size.pt for run in runs if "Тур 2" not in run.text} == {32.0}
     assert {paragraph.line_spacing for paragraph in textbox.text_frame.paragraphs} == {
         None
     }
@@ -831,6 +1050,136 @@ def test_inline_handout_uses_handout_config_when_not_separate_slide(tmp_path):
     assert {
         run.font.size.pt for run in question_paragraph.runs if run.text.strip()
     } == {24.0}
+
+
+def test_inline_handout_line_uses_larger_default_handout_font(tmp_path):
+    prs = _export_pptx(
+        tmp_path,
+        [
+            ("heading", "Тестовый пакет"),
+            (
+                "Question",
+                {
+                    "question": (
+                        "Раздаточный материал: Klemperer\n"
+                        "Чтобы спастись от гестапо, супруги Клемперер решили "
+                        "подделать свои документы."
+                    ),
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+        config_updates={
+            "add_handout_on_separate_slide": False,
+            "force_text_size_question": 24,
+            "font": {"default_size": None, "question_size": None},
+        },
+    )
+
+    question_shape = next(
+        shape
+        for shape in prs.slides[1].shapes
+        if hasattr(shape, "text_frame") and "Klemperer" in shape.text
+    )
+    handout_paragraph = question_shape.text_frame.paragraphs[0]
+    question_paragraph = question_shape.text_frame.paragraphs[1]
+
+    assert handout_paragraph.text == "Klemperer"
+    assert {
+        run.font.size.pt for run in handout_paragraph.runs if run.text.strip()
+    } == {42.0}
+    assert question_paragraph.text.startswith("Чтобы спастись")
+    assert {
+        run.font.size.pt for run in question_paragraph.runs if run.text.strip()
+    } == {24.0}
+
+
+def test_inline_handout_font_size_shrinks_to_preserve_source_lines(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        PptxExporter, "_get_measurement_font_path", lambda self: "fake-font"
+    )
+    monkeypatch.setattr(
+        PptxExporter,
+        "_measure_text_width_px",
+        lambda self, font_path, text, size: len(text) * size,
+    )
+    prs = _export_pptx(
+        tmp_path,
+        [
+            ("heading", "Тестовый пакет"),
+            (
+                "Question",
+                {
+                    "question": (
+                        "[Раздаточный материал: abcdefghijklmnopqrstuvwxy]\n"
+                        "Здесь начинается текст вопроса"
+                    ),
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+        config_updates={
+            "force_text_size_question": 32,
+            "font": {"default_size": None, "question_size": None},
+            "handout": {"include_label": False, "font_size": 42},
+        },
+    )
+
+    question_shape = next(
+        shape
+        for shape in prs.slides[2].shapes
+        if hasattr(shape, "text_frame") and "abcdefghijklmnopqrstuvwxy" in shape.text
+    )
+    handout_paragraph = question_shape.text_frame.paragraphs[0]
+    question_paragraph = question_shape.text_frame.paragraphs[1]
+
+    assert handout_paragraph.text == "abcdefghijklmnopqrstuvwxy"
+    assert {
+        run.font.size.pt for run in handout_paragraph.runs if run.text.strip()
+    } == {39.0}
+    assert {
+        run.font.size.pt for run in question_paragraph.runs if run.text.strip()
+    } == {32.0}
+
+
+def test_inline_handout_text_spacing_can_be_configured(tmp_path):
+    prs = _export_pptx(
+        tmp_path,
+        [
+            ("heading", "Тестовый пакет"),
+            (
+                "Question",
+                {
+                    "question": (
+                        "[Раздаточный материал: Klemperer]\n"
+                        "Чтобы спастись от гестапо, супруги Клемперер решили "
+                        "подделать свои документы."
+                    ),
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+        config_updates={
+            "add_handout_on_separate_slide": False,
+            "handout": {
+                "include_label": False,
+                "font_size": 32,
+                "space_after": 42,
+                "text_space_after": 7,
+            },
+        },
+    )
+
+    question_shape = next(
+        shape
+        for shape in prs.slides[1].shapes
+        if hasattr(shape, "text_frame") and "Klemperer" in shape.text
+    )
+    handout_paragraph = question_shape.text_frame.paragraphs[0]
+
+    assert handout_paragraph.space_after.pt == 7.0
 
 
 def test_multiline_inline_handout_uses_soft_breaks_without_extra_paragraphs(tmp_path):

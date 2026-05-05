@@ -965,6 +965,62 @@ def test_embed_fonts_in_docx_subsets_to_used_characters(tmp_path):
     assert 67 not in cmap
 
 
+def test_embed_fonts_in_pptx_embeds_subset_font_data(tmp_path):
+    import struct
+
+    from fontTools.ttLib import TTFont
+    from pptx import Presentation
+
+    from chgksuite.composer.pptx import embed_fonts_in_pptx
+
+    font_path = tmp_path / "TestEmbed-Regular.ttf"
+    _write_test_ttf(font_path, characters="ABC")
+    pptx_path = tmp_path / "test.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(0, 0, 1000, 1000).text = "AB"
+    prs.save(pptx_path)
+
+    embed_fonts_in_pptx(
+        pptx_path,
+        str(font_path),
+        font_name="Test Embed",
+        subset_characters=set("AB"),
+    )
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        content_types = pptx_file.read("[Content_Types].xml").decode("utf-8")
+        presentation = ET.fromstring(pptx_file.read("ppt/presentation.xml"))
+        rels = ET.fromstring(pptx_file.read("ppt/_rels/presentation.xml.rels"))
+        embedded_font = next(
+            element for element in presentation.iter() if element.tag.endswith("embeddedFont")
+        )
+        font_el = next(element for element in embedded_font if element.tag.endswith("font"))
+        regular_el = next(
+            element for element in embedded_font if element.tag.endswith("regular")
+        )
+        rel_id = regular_el.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+        rel = next(element for element in rels if element.get("Id") == rel_id)
+        eot_data = pptx_file.read("ppt/" + rel.get("Target"))
+
+    eot_size, font_size, version, flags = struct.unpack_from("<IIII", eot_data)
+    assert font_el.get("typeface") == "Test Embed"
+    assert rel.get("Type").endswith("/font")
+    assert "application/x-fontdata" in content_types
+    assert eot_size == len(eot_data)
+    assert version == 0x00020001
+    assert flags == 1
+
+    subset_font = TTFont(BytesIO(eot_data[-font_size:]))
+    cmap = subset_font.getBestCmap()
+    subset_font.close()
+    assert 65 in cmap
+    assert 66 in cmap
+    assert 67 not in cmap
+
+
 def test_optimize_docx_images_recompresses_png_as_jpeg(tmp_path):
     from docx import Document
 
@@ -1115,12 +1171,13 @@ def test_docx_cli_accepts_font_and_embed_fonts():
     assert legacy_args.optimize_size == "off"
 
     pptx_args = parser.parse_args(
-        ["compose", "pptx", "--font", "Test PPT", "test.4s"]
+        ["compose", "pptx", "--font", "Test PPT", "--embed_fonts", "on", "test.4s"]
     )
     pptx_no_optimize_args = parser.parse_args(
         ["compose", "pptx", "--optimize_size", "off", "test.4s"]
     )
     assert pptx_args.font == "Test PPT"
+    assert pptx_args.embed_fonts == "on"
     assert pptx_args.optimize_size == "on"
     assert pptx_no_optimize_args.optimize_size == "off"
 

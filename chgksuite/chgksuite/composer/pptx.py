@@ -1,15 +1,38 @@
 import copy
 import os
 import re
+import struct
+import tempfile
+import urllib.parse
+import zipfile
+import xml.etree.ElementTree as ET
 
 import toml
 
-from chgksuite.common import log_wrap, optimize_ooxml_images, replace_escaped, tryint
+from chgksuite.common import (
+    _rewrite_zip_package,
+    log_wrap,
+    optimize_ooxml_images,
+    replace_escaped,
+    tryint,
+)
 from chgksuite.composer.composer_common import (
     BaseExporter,
     backtick_replace,
     parseimg,
     remove_accents_standalone,
+)
+from chgksuite.composer.docx import (
+    _HYPERLINK_SAFE_CHARS,
+    _docx_font_name,
+    _docx_font_spec,
+    _embed_fonts_enabled,
+    _ensure_content_type_override,
+    _load_xml_part,
+    _next_relationship_id,
+    _select_font_faces,
+    _subset_font_faces,
+    _xml_bytes,
 )
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -18,6 +41,39 @@ from pptx.enum.lang import MSO_LANGUAGE_ID
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
+
+
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_FONTDATA_CONTENT_TYPE = "application/x-fontdata"
+_FONT_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/font"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PPTX_HYPERLINK_COLOR = (0x05, 0x63, 0xC1)
+_EMU_PER_INCH = 914400
+_PX_PER_INCH = 96
+_PT_PER_INCH = 72
+_PPTX_FONT_TAGS = {
+    "regular": "regular",
+    "bold": "bold",
+    "italic": "italic",
+    "bold_italic": "boldItalic",
+}
+_PPTX_PRESENTATION_INSERT_BEFORE = {
+    f"{{{_P_NS}}}custShowLst",
+    f"{{{_P_NS}}}photoAlbum",
+    f"{{{_P_NS}}}custDataLst",
+    f"{{{_P_NS}}}kinsoku",
+    f"{{{_P_NS}}}defaultTextStyle",
+    f"{{{_P_NS}}}modifyVerifier",
+    f"{{{_P_NS}}}extLst",
+}
+_PPTX_TEXT_TAGS = {f"{{{_A_NS}}}t"}
+
+ET.register_namespace("a", _A_NS)
+ET.register_namespace("p", _P_NS)
+ET.register_namespace("r", _R_NS)
 
 
 def _optimize_size_enabled(args):
@@ -30,17 +86,292 @@ def optimize_pptx_images(pptx_path, quality=80):
     )
 
 
+def _get_pptx_handout_text_space_after(handout_cfg):
+    return handout_cfg.get("text_space_after", handout_cfg.get("space_after", 18))
+
+
+def _next_pptx_font_part_name(existing_names, extension=".fntdata"):
+    index = 1
+    while f"ppt/fonts/font{index}{extension}" in existing_names:
+        index += 1
+    return f"ppt/fonts/font{index}{extension}"
+
+
+def _pptx_relationship_target_for_part(part_name):
+    return os.path.relpath(part_name, "ppt").replace(os.sep, "/")
+
+
+def _utf16le_bytes(text):
+    return (text or "").encode("utf-16le")
+
+
+def _font_panose_bytes(os2_table):
+    panose = getattr(os2_table, "panose", None)
+    if panose is None:
+        return b"\x00" * 10
+    fields = (
+        "bFamilyType",
+        "bSerifStyle",
+        "bWeight",
+        "bProportion",
+        "bContrast",
+        "bStrokeVariation",
+        "bArmStyle",
+        "bLetterForm",
+        "bMidline",
+        "bXHeight",
+    )
+    return bytes(getattr(panose, field, 0) & 0xFF for field in fields)
+
+
+def _eot_font_metadata(font_path, face):
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(font_path, lazy=True)
+    try:
+        os2_table = font.get("OS/2")
+        head_table = font.get("head")
+        name_table = font.get("name")
+        return {
+            "panose": _font_panose_bytes(os2_table) if os2_table else b"\x00" * 10,
+            "charset": 1,
+            "italic": int(bool(os2_table and (os2_table.fsSelection & 0x01))),
+            "weight": getattr(os2_table, "usWeightClass", 400) if os2_table else 400,
+            "fs_type": getattr(os2_table, "fsType", 0) if os2_table else 0,
+            "unicode_ranges": tuple(
+                getattr(os2_table, f"ulUnicodeRange{index}", 0)
+                for index in range(1, 5)
+            )
+            if os2_table
+            else (0, 0, 0, 0),
+            "code_page_ranges": (
+                getattr(os2_table, "ulCodePageRange1", 0) if os2_table else 0,
+                getattr(os2_table, "ulCodePageRange2", 0) if os2_table else 0,
+            ),
+            "checksum_adjustment": getattr(head_table, "checkSumAdjustment", 0),
+            "family": face.family,
+            "style": face.subfamily or "Regular",
+            "version": name_table.getDebugName(5) if name_table else "",
+            "full_name": face.full_name or face.family,
+        }
+    finally:
+        font.close()
+
+
+def _font_file_to_eot_bytes(font_path, face, subset=False):
+    with open(font_path, "rb") as font_file:
+        font_data = font_file.read()
+    metadata = _eot_font_metadata(font_path, face)
+    family = _utf16le_bytes(metadata["family"])
+    style = _utf16le_bytes(metadata["style"])
+    version = _utf16le_bytes(metadata["version"])
+    full_name = _utf16le_bytes(metadata["full_name"])
+
+    flags = 0x0001 if subset else 0
+    string_payload = b"".join(
+        (
+            family,
+            struct.pack("<H", 0),
+            struct.pack("<H", len(style)),
+            style,
+            struct.pack("<H", 0),
+            struct.pack("<H", len(version)),
+            version,
+            struct.pack("<H", 0),
+            struct.pack("<H", len(full_name)),
+            full_name,
+            struct.pack("<H", 0),
+            struct.pack("<H", 0),
+        )
+    )
+    eot_size = 84 + len(string_payload) + len(font_data)
+    header = struct.pack(
+        "<IIII10sBBIHHIIIIIIIIIIIHH",
+        eot_size,
+        len(font_data),
+        0x00020001,
+        flags,
+        metadata["panose"],
+        metadata["charset"],
+        metadata["italic"],
+        metadata["weight"],
+        metadata["fs_type"],
+        0x504C,
+        *metadata["unicode_ranges"],
+        *metadata["code_page_ranges"],
+        metadata["checksum_adjustment"],
+        0,
+        0,
+        0,
+        0,
+        0,
+        len(family),
+    )
+    return header + string_payload + font_data
+
+
+def _get_or_create_embedded_font_list(presentation_root):
+    embedded_font_list = presentation_root.find(f"{{{_P_NS}}}embeddedFontLst")
+    if embedded_font_list is not None:
+        return embedded_font_list
+
+    embedded_font_list = ET.Element(f"{{{_P_NS}}}embeddedFontLst")
+    for index, child in enumerate(list(presentation_root)):
+        if child.tag in _PPTX_PRESENTATION_INSERT_BEFORE:
+            presentation_root.insert(index, embedded_font_list)
+            break
+    else:
+        presentation_root.append(embedded_font_list)
+    return embedded_font_list
+
+
+def _remove_embedded_font_entry(embedded_font_list, font_name):
+    for embedded_font in list(
+        embedded_font_list.findall(f"{{{_P_NS}}}embeddedFont")
+    ):
+        font_el = embedded_font.find(f"{{{_P_NS}}}font")
+        if font_el is not None and font_el.get("typeface") == font_name:
+            embedded_font_list.remove(embedded_font)
+
+
+def collect_pptx_used_characters(pptx_path):
+    characters = set()
+    visible_xml_prefixes = (
+        "ppt/slides/",
+        "ppt/notesSlides/",
+        "ppt/slideMasters/",
+        "ppt/slideLayouts/",
+    )
+
+    with zipfile.ZipFile(pptx_path, "r") as pptx_zip:
+        for name in pptx_zip.namelist():
+            if not name.startswith(visible_xml_prefixes) or not name.endswith(".xml"):
+                continue
+            try:
+                root = ET.fromstring(pptx_zip.read(name))
+            except ET.ParseError:
+                continue
+            for element in root.iter():
+                if element.tag in _PPTX_TEXT_TAGS and element.text:
+                    characters.update(element.text)
+    return characters
+
+
+def embed_fonts_in_pptx(
+    pptx_path,
+    font_spec,
+    font_name=None,
+    font_faces=None,
+    search_dirs=None,
+    subset_characters=None,
+):
+    if not font_spec:
+        raise ValueError("--embed_fonts=on requires --font.")
+
+    font_faces = font_faces or _select_font_faces(font_spec, search_dirs=search_dirs)
+    font_name = font_name or _docx_font_name(font_spec, font_faces)
+    subset_tmp_dir = None
+    subset = subset_characters is not None
+    if subset:
+        subset_tmp_dir = tempfile.TemporaryDirectory()
+        font_faces = _subset_font_faces(
+            font_faces, subset_characters, subset_tmp_dir.name
+        )
+
+    try:
+        with zipfile.ZipFile(pptx_path, "r") as pptx_zip:
+            existing_names = set(pptx_zip.namelist())
+            content_types_root = _load_xml_part(
+                pptx_zip,
+                "[Content_Types].xml",
+                ET.Element(f"{{{_CONTENT_TYPES_NS}}}Types"),
+            )
+            presentation_root = _load_xml_part(
+                pptx_zip,
+                "ppt/presentation.xml",
+                ET.Element(f"{{{_P_NS}}}presentation"),
+            )
+            rels_root = _load_xml_part(
+                pptx_zip,
+                "ppt/_rels/presentation.xml.rels",
+                ET.Element(f"{{{_PACKAGE_REL_NS}}}Relationships"),
+            )
+
+        replacements = {}
+        font_relationships = {}
+        for role, face in font_faces.items():
+            part_name = _next_pptx_font_part_name(existing_names)
+            existing_names.add(part_name)
+            rel_id = _next_relationship_id(rels_root)
+            ET.SubElement(
+                rels_root,
+                f"{{{_PACKAGE_REL_NS}}}Relationship",
+                {
+                    "Id": rel_id,
+                    "Type": _FONT_REL_TYPE,
+                    "Target": _pptx_relationship_target_for_part(part_name),
+                },
+            )
+            _ensure_content_type_override(
+                content_types_root, f"/{part_name}", _FONTDATA_CONTENT_TYPE
+            )
+            replacements[part_name] = _font_file_to_eot_bytes(
+                face.path, face, subset=subset
+            )
+            font_relationships[role] = rel_id
+
+        embedded_font_list = _get_or_create_embedded_font_list(presentation_root)
+        _remove_embedded_font_entry(embedded_font_list, font_name)
+        embedded_font = ET.SubElement(embedded_font_list, f"{{{_P_NS}}}embeddedFont")
+        ET.SubElement(embedded_font, f"{{{_P_NS}}}font", {"typeface": font_name})
+        for role in ("regular", "bold", "italic", "bold_italic"):
+            if role not in font_relationships:
+                continue
+            ET.SubElement(
+                embedded_font,
+                f"{{{_P_NS}}}{_PPTX_FONT_TAGS[role]}",
+                {f"{{{_R_NS}}}id": font_relationships[role]},
+            )
+
+        presentation_root.set("saveSubsetFonts", "1" if subset else "0")
+        replacements.update(
+            {
+                "[Content_Types].xml": _xml_bytes(
+                    content_types_root, default_namespace=_CONTENT_TYPES_NS
+                ),
+                "ppt/presentation.xml": _xml_bytes(presentation_root),
+                "ppt/_rels/presentation.xml.rels": _xml_bytes(
+                    rels_root, default_namespace=_PACKAGE_REL_NS
+                ),
+            }
+        )
+        _rewrite_zip_package(pptx_path, replacements)
+        return font_faces
+    finally:
+        if subset_tmp_dir is not None:
+            subset_tmp_dir.cleanup()
+
+
 class PptxExporter(BaseExporter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config_path = os.path.abspath(self.args.pptx_config)
         with open(self.config_path, encoding="utf8") as f:
             self.c = toml.load(f)
-        if getattr(self.args, "font", None):
+        self.font_spec = _docx_font_spec(self.args)
+        self.font_faces = None
+        self.optimize_size = _optimize_size_enabled(self.args)
+        if _embed_fonts_enabled(self.args):
+            if not self.font_spec:
+                raise ValueError("--embed_fonts=on requires --font.")
+            self.font_faces = _select_font_faces(self.font_spec)
+        self.font_name = _docx_font_name(self.font_spec, self.font_faces)
+        self._measurement_font_faces = None
+        if self.font_name:
             font_cfg = self.c.setdefault("font", {})
-            font_cfg["name"] = self.args.font
+            font_cfg["name"] = self.font_name
             if "heading_name" in font_cfg:
-                font_cfg["heading_name"] = self.args.font
+                font_cfg["heading_name"] = self.font_name
         self.qcount = 0
         hs = self.labels["question_labels"]["handout"]
         self.re_handout_1 = re.compile(
@@ -66,6 +397,8 @@ class PptxExporter(BaseExporter):
         if key == "answer_size":
             if self.c.get("force_text_size_answer") is not None:
                 return self.c["force_text_size_answer"]
+            return self._get_font_size("default_size", fallback)
+        if key == "tour_size":
             return self._get_font_size("default_size", fallback)
         if key == "default_size":
             if self.c.get("force_text_size_question") is not None:
@@ -367,6 +700,91 @@ class PptxExporter(BaseExporter):
     def _get_handout_space_after(self):
         return self.c.get("handout", {}).get("space_after", 18)
 
+    def _get_handout_text_space_after(self):
+        return _get_pptx_handout_text_space_after(self.c.get("handout", {}))
+
+    def _get_handout_font_size(self):
+        handout_cfg = self.c.get("handout", {})
+        if handout_cfg.get("font_size") is not None:
+            return handout_cfg["font_size"]
+        return self._get_font_size("tour_size", 42)
+
+    def _get_measurement_font_path(self):
+        if self.font_faces and self.font_faces.get("regular"):
+            return self.font_faces["regular"].path
+        if not self.font_spec:
+            return None
+        if self._measurement_font_faces is None:
+            try:
+                self._measurement_font_faces = _select_font_faces(self.font_spec)
+            except (OSError, PermissionError, ValueError):
+                self._measurement_font_faces = {}
+        face = self._measurement_font_faces.get("regular")
+        return face.path if face else None
+
+    def _measure_text_width_px(self, font_path, text, font_size):
+        from PIL import ImageFont
+
+        pixel_size = max(1, round(float(font_size) * _PX_PER_INCH / _PT_PER_INCH))
+        font = ImageFont.truetype(font_path, size=pixel_size)
+        if hasattr(font, "getlength"):
+            return font.getlength(text)
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0]
+
+    def _textbox_inner_width_px(self, textbox):
+        text_frame = textbox.text_frame
+        margin_left = text_frame.margin_left or 0
+        margin_right = text_frame.margin_right or 0
+        inner_width = max(textbox.width - margin_left - margin_right, 1)
+        return inner_width / _EMU_PER_INCH * _PX_PER_INCH
+
+    def _plain_text_lines_for_measurement(self, text):
+        lines = [""]
+
+        def append_text(value):
+            parts = str(value).split("\n")
+            lines[-1] += parts[0]
+            for part in parts[1:]:
+                lines.append(part)
+
+        for run in self.parse_4s_elem(backtick_replace(text)):
+            if run[0] == "screen":
+                append_text(run[1]["for_screen"])
+            elif run[0] == "linebreak":
+                lines.append("")
+            elif run[0] in ("img", "pagebreak"):
+                continue
+            else:
+                append_text(run[1])
+        return [line for line in lines if line.strip()]
+
+    def _get_handout_font_size_for_text(self, text, textbox, min_size=None):
+        max_size = self._get_handout_font_size()
+        min_size = min_size or self._get_font_size("question_size", 32)
+        if max_size <= min_size:
+            return max_size
+
+        font_path = self._get_measurement_font_path()
+        if not font_path:
+            return max_size
+
+        lines = self._plain_text_lines_for_measurement(text)
+        if not lines:
+            return max_size
+
+        max_width = self._textbox_inner_width_px(textbox) * 0.99
+        current_size = float(max_size)
+        min_size = float(min_size)
+        while current_size > min_size:
+            if all(
+                self._measure_text_width_px(font_path, line, current_size) <= max_width
+                for line in lines
+            ):
+                return current_size
+            current_size -= 1
+        return min_size
+
     def _get_handout_image_scale(self):
         return self.c.get("handout", {}).get("image_scale", 1)
 
@@ -469,6 +887,15 @@ class PptxExporter(BaseExporter):
         self._apply_text_style(runs, style)
         return runs
 
+    def add_hyperlink_runs(self, para, text, url):
+        hyperlink_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+        runs = self.add_runs(para, text)
+        for run in runs:
+            run.hyperlink.address = hyperlink_url
+            run.font.underline = True
+            run.font.color.rgb = RGBColor(*_PPTX_HYPERLINK_COLOR)
+        return runs
+
     def pptx_format(
         self, el, para, tf, slide, replace_spaces=True, blank_lines_between_items=False
     ):
@@ -537,6 +964,9 @@ class PptxExporter(BaseExporter):
                     runs = self.add_runs(para, r_sp(run[1]))
                     for r in runs:
                         r.font.strike = True  # TODO: doesn't work as of 2023-12-24, cf. https://github.com/scanny/python-pptx/issues/339
+
+                elif run[0] == "hyperlink":
+                    self.add_hyperlink_runs(para, run[1], run[1])
 
                 elif run[0] == "img":
                     pass  # image processing is moved to other places
@@ -665,24 +1095,27 @@ class PptxExporter(BaseExporter):
                 heading_font = self._get_heading_font_name()
                 if heading_font:
                     r.font.name = heading_font
+                r.font.size = PptxPt(self._get_font_size("tour_size", 32))
                 add_line_break = True
         if editor:
-            r = self.add_run(
+            if add_line_break:
+                self.add_run(p, "\n\n")
+            self.pptx_format(
+                self.pptx_process_text(editor[0][1]),
                 p,
-                self._replace_no_break(
-                    ("\n\n" if add_line_break else "")
-                    + self.pptx_process_text(editor[0][1])
-                ),
+                tf,
+                slide,
             )
             add_line_break = True
         if meta:
             for element in meta:
-                r = self.add_run(
+                if add_line_break:
+                    self.add_run(p, "\n\n")
+                self.pptx_format(
+                    self.pptx_process_text(element[1]),
                     p,
-                    self._replace_no_break(
-                        ("\n\n" if add_line_break else "")
-                        + self.pptx_process_text(element[1])
-                    ),
+                    tf,
+                    slide,
                 )
                 add_line_break = True
 
@@ -790,14 +1223,27 @@ class PptxExporter(BaseExporter):
         if not isinstance(text, str):
             return None, text
         match_ = self.re_handout_1.search(text)
-        if not match_:
-            return None, text
-        if self._include_handout_label():
-            handout = match_.group(0)
-        else:
-            handout = match_.group("body")
-        question = f"{text[: match_.start()]}{text[match_.end() :]}"
-        return handout.strip(), question.strip()
+        if match_:
+            if self._include_handout_label():
+                handout = match_.group(0)
+            else:
+                handout = match_.group("body")
+            question = f"{text[: match_.start()]}{text[match_.end() :]}"
+            return handout.strip(), question.strip()
+
+        lines = text.split("\n")
+        for index, line in enumerate(lines):
+            match_ = self.re_handout_2.search(line.strip())
+            if not match_:
+                continue
+            if self._include_handout_label():
+                handout = line
+            else:
+                handout = match_.group("body")
+            question = "\n".join(lines[:index] + lines[index + 1 :])
+            return handout.strip(), question.strip()
+
+        return None, text
 
     def _get_image_from_4s(self, text):
         if isinstance(text, list):
@@ -952,7 +1398,7 @@ class PptxExporter(BaseExporter):
         self.set_question_number(slide, self.number)
         question = q["question"]
         handout = None
-        if not image and not self._add_handout_on_separate_slide():
+        if not image:
             handout, question = self._split_handout_from_text(question)
         question_text = self.pptx_process_text(question, image=image)
         question_size = self._get_font_size_for_text(
@@ -960,17 +1406,24 @@ class PptxExporter(BaseExporter):
         )
         if handout:
             handout_cfg = self.c.get("handout", {})
+            handout_text = self.pptx_process_text(
+                handout, do_not_remove_accents=True
+            )
             handout_p = self.init_paragraph(
-                tf, size=handout_cfg.get("font_size"), line_spacing_key="handout"
+                tf,
+                size=self._get_handout_font_size_for_text(
+                    handout_text, textbox, min_size=question_size
+                ),
+                line_spacing_key="handout",
             )
             self._set_paragraph_alignment(handout_p, handout_cfg.get("align"))
             self.pptx_format(
-                self.pptx_process_text(handout, do_not_remove_accents=True),
+                handout_text,
                 handout_p,
                 tf,
                 slide,
             )
-            handout_p.space_after = PptxPt(self._get_handout_space_after())
+            handout_p.space_after = PptxPt(self._get_handout_text_space_after())
             p = self._configure_paragraph(
                 tf.add_paragraph(),
                 size=question_size,
@@ -999,13 +1452,14 @@ class PptxExporter(BaseExporter):
         if number is not None:
             self.set_question_number(slide, number)
         handout_cfg = self.c.get("handout", {})
+        handout_text = self.pptx_process_text(handout, do_not_remove_accents=True)
         p = self.init_paragraph(
-            tf, size=handout_cfg.get("font_size"), line_spacing_key="handout"
+            tf,
+            size=self._get_handout_font_size_for_text(handout_text, textbox),
+            line_spacing_key="handout",
         )
         self._set_paragraph_alignment(p, handout_cfg.get("align"))
-        self.pptx_format(
-            self.pptx_process_text(handout, do_not_remove_accents=True), p, tf, slide
-        )
+        self.pptx_format(handout_text, p, tf, slide)
 
     def process_question_text(self, q):
         image = self._get_image_from_4s(q["question"])
@@ -1166,6 +1620,17 @@ class PptxExporter(BaseExporter):
         self._add_service_slides("final")
         self._remove_service_slide_templates()
         self.prs.save(outfilename)
-        if _optimize_size_enabled(self.args):
+        subset_characters = None
+        if self.optimize_size:
+            if _embed_fonts_enabled(self.args):
+                subset_characters = collect_pptx_used_characters(outfilename)
             optimize_pptx_images(outfilename, quality=80)
+        if _embed_fonts_enabled(self.args):
+            embed_fonts_in_pptx(
+                outfilename,
+                self.font_spec,
+                font_name=self.font_name,
+                font_faces=self.font_faces,
+                subset_characters=subset_characters,
+            )
         self.logger.info("Output: {}".format(outfilename))

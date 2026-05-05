@@ -24,9 +24,10 @@ blank_line_before_items = true
 
 [handout]
 include_label = false
-font_size = 32
+font_size = 42
 align = "left"
 space_after = 18
+text_space_after = 18
 image_scale = 1.3
 
 [font]
@@ -36,3 +37,4 @@ question_size = 32
 answer_size = 32
 number_size = 32
 title_size = 60
+tour_size = 42
