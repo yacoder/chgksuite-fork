@@ -184,10 +184,19 @@ with open(os.path.join(parentdir, "chgksuite", "resources", "regexes_ru.json")) 
 SQUARE_BRACKET_TEST_CASES = [
     ("black [блэк]", "black"),
     ("black [блэк] смотрит [looks]", "black смотрит"),
+    ("black [блэк [black]] смотрит", "black смотрит"),
+    (
+        "[Ведущему: слово «kei» читать как букву K [кей]. Паузы нет.]\nKei — вопрос.",
+        "Kei — вопрос.",
+    ),
     (
         "text with [Раздаточный материал: handout] here",
         "text with [Раздаточный материал: handout] here",
     ),  # handout preserved
+    (
+        "text with [Раздаточный материал: handout [nested]] here",
+        "text with [Раздаточный материал: handout [nested]] here",
+    ),  # nested brackets in handouts preserved
     ("text \\[escaped\\]", "text [escaped]"),  # escaped brackets restored
     ("simple text", "simple text"),  # no brackets
 ]
@@ -205,6 +214,10 @@ ACCENT_TEST_CASES = [
         "[Раздаточный материал: при́вет]",
         "[Раздаточный материал: при́вет]",
     ),  # accent in handout preserved
+    (
+        "[Раздаточный материал: при́вет [сло́во]] вне́",
+        "[Раздаточный материал: при́вет [сло́во]] вне",
+    ),  # nested brackets in handout preserved
     ("simple text", "simple text"),  # no accents
 ]
 

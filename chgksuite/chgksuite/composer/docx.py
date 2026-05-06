@@ -30,6 +30,7 @@ from chgksuite.composer.composer_common import (
     backtick_replace,
     parseimg,
     remove_accents_standalone,
+    remove_square_brackets_standalone as _remove_square_brackets_standalone,
 )
 
 WHITEN = {
@@ -413,30 +414,7 @@ def get_label_standalone(
 
 def remove_square_brackets_standalone(s, regexes):
     """Standalone version of remove_square_brackets"""
-    hs = regexes["handout_short"]
-    s = s.replace("\\[", "LEFTSQUAREBRACKET")
-    s = s.replace("\\]", "RIGHTSQUAREBRACKET")
-    # Use placeholder to preserve handout brackets during removal
-    s = re.sub(f"\\[({hs}.+?)\\]", "{HANDOUT_PLACEHOLDER\\1}", s, flags=re.DOTALL)
-    i = 0
-    while "[" in s and "]" in s and i < 10:
-        s = re.sub(" *\\[.+?\\]", "", s, flags=re.DOTALL)
-        s = s.strip()
-        i += 1
-    if i == 10:
-        sys.stderr.write(
-            f"Error replacing square brackets on question: {s}, retries exceeded\n"
-        )
-    # Restore handout brackets - get the original matched text from the placeholder
-    s = re.sub(
-        r"\{HANDOUT_PLACEHOLDER(.+?)\}",
-        lambda m: "[" + m.group(1) + "]",
-        s,
-        flags=re.DOTALL,
-    )
-    s = s.replace("LEFTSQUAREBRACKET", "[")
-    s = s.replace("RIGHTSQUAREBRACKET", "]")
-    return s
+    return _remove_square_brackets_standalone(s, regexes)
 
 
 def set_docx_run_text(run, text):

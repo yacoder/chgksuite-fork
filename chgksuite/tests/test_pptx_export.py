@@ -415,6 +415,33 @@ def test_pptx_export_preserves_zachet_brackets(tmp_path):
     assert "[убрать]" not in text
 
 
+def test_pptx_export_removes_nested_reader_note_brackets(tmp_path):
+    prs = _export_pptx(
+        tmp_path,
+        [
+            (
+                "Question",
+                {
+                    "question": (
+                        "[Ведущему: слово «kei» читать просто как английскую "
+                        "букву K [кей]. В третьем предложении нужно сделать "
+                        "логическое ударение на слове «ЭТОГО».]\n"
+                        "Kei — это класс небольших автомобилей."
+                    ),
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+    )
+
+    text = "\n".join(_slide_text(slide).replace("\xa0", " ") for slide in prs.slides)
+
+    assert "Kei — это класс небольших автомобилей." in text
+    assert "Ведущему" not in text
+    assert "кей" not in text
+    assert "ЭТОГО" not in text
+
+
 def test_title_slide_uses_full_height_centered_textbox(tmp_path):
     prs = _export_pptx(
         tmp_path,

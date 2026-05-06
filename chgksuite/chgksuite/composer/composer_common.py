@@ -17,7 +17,13 @@ import toml
 from PIL import Image
 
 import chgksuite.typotools as typotools
-from chgksuite.common import DummyLogger, get_chgksuite_dir, init_logger, log_wrap
+from chgksuite.common import (
+    DummyLogger,
+    get_chgksuite_dir,
+    init_logger,
+    log_wrap,
+    replace_escaped,
+)
 from chgksuite.typotools import re_lowercase, re_percent, re_uppercase
 
 
@@ -59,20 +65,101 @@ def backtick_replace(el):
     return el
 
 
+def _is_escaped_square_bracket(s, index):
+    return s[index] == "\\" and index + 1 < len(s) and s[index + 1] in "[]"
+
+
+def _find_matching_square_bracket(s, index):
+    if index >= len(s) or s[index] != "[":
+        return None
+    depth = 0
+    while index < len(s):
+        if _is_escaped_square_bracket(s, index):
+            index += 2
+            continue
+        if s[index] == "[":
+            depth += 1
+        elif s[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _iter_square_bracket_spans(s):
+    index = 0
+    while index < len(s):
+        if _is_escaped_square_bracket(s, index):
+            index += 2
+            continue
+        if s[index] != "[":
+            index += 1
+            continue
+        end = _find_matching_square_bracket(s, index)
+        if end is None:
+            index += 1
+            continue
+        yield index, end + 1, s[index + 1 : end]
+        index = end + 1
+
+
+def _is_handout_square_bracket_body(body, regexes):
+    return bool(re.match(regexes["handout_short"], body, flags=re.DOTALL))
+
+
+def _process_outside_handout_square_brackets(s, regexes, process):
+    result = []
+    previous_end = 0
+    for start, end, body in _iter_square_bracket_spans(s):
+        if not _is_handout_square_bracket_body(body, regexes):
+            continue
+        result.append(process(s[previous_end:start]))
+        result.append(s[start:end])
+        previous_end = end
+    result.append(process(s[previous_end:]))
+    return "".join(result)
+
+
 def remove_accents_standalone(s, regexes):
-    hs = regexes["handout_short"]
-    re_hs = re.compile(f"\\[{hs}(.+?)\\]", flags=re.DOTALL)
-    replacements = {}
-    n_handouts = 0
-    while match := re_hs.search(s):
-        original = match.group(0)
-        n_handouts += 1
-        replacements[original] = f"HANDOUT_{str(n_handouts).zfill(3)}"
-        s = s.replace(original, replacements[original])
-    s = s.replace("\u0301", "")
-    for k, v in replacements.items():
-        s = s.replace(v, k)
-    return s
+    return _process_outside_handout_square_brackets(
+        s, regexes, lambda text: text.replace("\u0301", "")
+    )
+
+
+def remove_square_brackets_standalone(s, regexes):
+    result = []
+    index = 0
+    removed = False
+    while index < len(s):
+        if _is_escaped_square_bracket(s, index):
+            result.append(s[index : index + 2])
+            index += 2
+            continue
+        if s[index] != "[":
+            result.append(s[index])
+            index += 1
+            continue
+
+        end = _find_matching_square_bracket(s, index)
+        if end is None:
+            result.append(s[index])
+            index += 1
+            continue
+
+        body = s[index + 1 : end]
+        if _is_handout_square_bracket_body(body, regexes):
+            result.append(s[index : end + 1])
+        else:
+            while result and result[-1] == " ":
+                result.pop()
+            removed = True
+        index = end + 1
+
+    s = "".join(result)
+    if removed:
+        s = s.strip()
+    return replace_escaped(s)
 
 
 def unquote(bytestring):
@@ -489,27 +576,4 @@ class BaseExporter:
         return self.labels["question_labels"][field]
 
     def remove_square_brackets(self, s):
-        hs = self.regexes["handout_short"]
-        s = s.replace("\\[", "LEFTSQUAREBRACKET")
-        s = s.replace("\\]", "RIGHTSQUAREBRACKET")
-        # Use placeholder to preserve handout brackets during removal
-        s = re.sub(f"\\[({hs}.+?)\\]", "{HANDOUT_PLACEHOLDER\\1}", s, flags=re.DOTALL)
-        i = 0
-        while "[" in s and "]" in s and i < 10:
-            s = re.sub(" *\\[.+?\\]", "", s, flags=re.DOTALL)
-            s = s.strip()
-            i += 1
-        if i == 10:
-            sys.stderr.write(
-                f"Error replacing square brackets on question: {s}, retries exceeded\n"
-            )
-        # Restore handout brackets - get the original matched text from the placeholder
-        s = re.sub(
-            r"\{HANDOUT_PLACEHOLDER(.+?)\}",
-            lambda m: "[" + m.group(1) + "]",
-            s,
-            flags=re.DOTALL,
-        )
-        s = s.replace("LEFTSQUAREBRACKET", "[")
-        s = s.replace("RIGHTSQUAREBRACKET", "]")
-        return s
+        return remove_square_brackets_standalone(s, self.regexes)
