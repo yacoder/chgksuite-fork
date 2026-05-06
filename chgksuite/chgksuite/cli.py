@@ -432,20 +432,10 @@ class ArgparseBuilder:
         )
         self.add_argument(
             cmdcompose_docx,
-            "--embed_fonts",
-            choices=["on", "off"],
-            default=default_overrides.get("embed_fonts") or "off",
-            help="embed the selected --font in the DOCX file.",
-            advanced=True,
-            caption="Встроить шрифт",
-            argtype="radiobutton",
-        )
-        self.add_argument(
-            cmdcompose_docx,
             "--optimize_size",
             choices=["on", "off"],
             default=default_overrides.get("optimize_size") or "on",
-            help="recompress images and subset embedded fonts to reduce DOCX size.",
+            help="recompress images to reduce DOCX size.",
             advanced=True,
             caption="Оптимизировать размер",
             argtype="radiobutton",
@@ -701,16 +691,6 @@ class ArgparseBuilder:
             help="recompress images to reduce PPTX size.",
             advanced=True,
             caption="Оптимизировать размер",
-            argtype="radiobutton",
-        )
-        self.add_argument(
-            cmdcompose_pptx,
-            "--embed_fonts",
-            choices=["on", "off"],
-            default=default_overrides.get("embed_fonts") or "off",
-            help="embed the selected --font in the PPTX file.",
-            advanced=True,
-            caption="Встроить шрифт",
             argtype="radiobutton",
         )
         self.add_argument(

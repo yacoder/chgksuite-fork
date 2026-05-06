@@ -177,6 +177,12 @@ class HandoutGenerator:
     def get_page_width(self):
         return self.args.paperwidth - self.args.margin_left - self.args.margin_right - 2
 
+    def get_block_max_width(self, block):
+        max_width = block.get("max_width", 1.0)
+        if max_width <= 0 or max_width > 1:
+            raise ValueError(f"max_width must be between 0 and 1, got {max_width}")
+        return max_width
+
     def resolve_image_path(self, image_path):
         if os.path.isabs(image_path):
             return image_path
@@ -399,8 +405,9 @@ class HandoutGenerator:
         tikz_mm = block.get("tikz_mm")
 
         spaces = columns - 1
+        available_width = self.get_page_width() * self.get_block_max_width(block)
         boxwidth = self.args.boxwidth or round(
-            (self.get_page_width() - spaces * hspace) / columns,
+            (available_width - spaces * hspace) / columns,
             3,
         )
         total_width = boxwidth * columns + spaces * hspace

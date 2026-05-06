@@ -46,9 +46,7 @@ def _config_path(tmp_path, updates=None):
     return str(path)
 
 
-def _pptx_args(
-    tmp_path, font=None, config_updates=None, optimize_size=None, embed_fonts=None
-):
+def _pptx_args(tmp_path, font=None, config_updates=None, optimize_size=None):
     args = DefaultArgs(
         pptx_config=_config_path(tmp_path, config_updates),
         labels_file=str(RESOURCES / "labels_ru.toml"),
@@ -60,8 +58,6 @@ def _pptx_args(
     )
     if optimize_size is not None:
         args.optimize_size = optimize_size
-    if embed_fonts is not None:
-        args.embed_fonts = embed_fonts
     return args
 
 
@@ -71,7 +67,6 @@ def _export_pptx(
     font=None,
     config_updates=None,
     optimize_size=None,
-    embed_fonts=None,
 ):
     return Presentation(
         str(
@@ -81,7 +76,6 @@ def _export_pptx(
                 font=font,
                 config_updates=config_updates,
                 optimize_size=optimize_size,
-                embed_fonts=embed_fonts,
             )
         )
     )
@@ -93,7 +87,6 @@ def _export_pptx_path(
     font=None,
     config_updates=None,
     optimize_size=None,
-    embed_fonts=None,
 ):
     outfilename = tmp_path / "out.pptx"
     exporter = PptxExporter(
@@ -103,7 +96,6 @@ def _export_pptx_path(
             font=font,
             config_updates=config_updates,
             optimize_size=optimize_size,
-            embed_fonts=embed_fonts,
         ),
         {"tmp_dir": str(tmp_path), "targetdir": str(tmp_path)},
     )
@@ -253,34 +245,6 @@ def test_pptx_exporter_can_disable_size_optimization(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_pptx_exporter_embeds_fonts_when_enabled(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    calls = []
-
-    def fake_embed(pptx_path, font_spec, **kwargs):
-        calls.append((Path(pptx_path).name, font_spec, kwargs))
-        return {}
-
-    monkeypatch.setattr(
-        "chgksuite.composer.pptx._select_font_faces",
-        lambda font_spec: {"regular": SimpleNamespace(family="Test Embed")},
-    )
-    monkeypatch.setattr("chgksuite.composer.pptx.embed_fonts_in_pptx", fake_embed)
-    _export_pptx(
-        tmp_path,
-        [("Question", {"question": "Question AB", "answer": "Answer."})],
-        font="Test Embed",
-        embed_fonts="on",
-    )
-
-    assert calls
-    _, font_spec, kwargs = calls[0]
-    assert font_spec == "Test Embed"
-    assert kwargs["font_name"] == "Test Embed"
-    assert {"A", "B"}.issubset(kwargs["subset_characters"])
-
-
 def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
     url = "https://example.com/ик-с?q=тест"
     encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
@@ -333,6 +297,54 @@ def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
     assert 'TargetMode="External"' in rels_xml
 
 
+def test_pptx_can_disable_hyperlink_formatting(tmp_path):
+    url = "https://example.com/ик-с?q=тест"
+    encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+    pptx_path = _export_pptx_path(
+        tmp_path,
+        [
+            (
+                "Question",
+                {
+                    "question": f"Ссылка: {url}.",
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+        config_updates={"format_links": False},
+    )
+    prs = Presentation(str(pptx_path))
+
+    link_runs = [
+        run
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text_frame")
+        for paragraph in shape.text_frame.paragraphs
+        for run in paragraph.runs
+        if run.text == url
+    ]
+
+    assert len(link_runs) == 1
+    assert not link_runs[0].hyperlink.address
+    assert link_runs[0].font.underline is not True
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        slide_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        )
+        rels_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/_rels/") and name.endswith(".rels")
+        )
+
+    assert '<a:hlinkClick r:id="' not in slide_xml
+    assert encoded_url not in rels_xml
+
+
 def test_pptx_block_metadata_hyperlinks_are_clickable_and_styled(tmp_path):
     url = "https://gotquestions.online"
     pptx_path = _export_pptx_path(
@@ -374,6 +386,33 @@ def test_pptx_block_metadata_hyperlinks_are_clickable_and_styled(tmp_path):
     ) in rels_xml
     assert f'Target="{url}"' in rels_xml
     assert 'TargetMode="External"' in rels_xml
+
+
+def test_pptx_export_preserves_zachet_brackets(tmp_path):
+    prs = _export_pptx(
+        tmp_path,
+        [
+            (
+                "Question",
+                {
+                    "question": "Вопрос [убрать].",
+                    "answer": "Ответ [оставить].",
+                    "zachet": "Зачет [оставить].",
+                    "nezachet": "Незачет [убрать].",
+                    "comment": "Комментарий [убрать].",
+                },
+            ),
+        ],
+    )
+
+    text = "\n".join(_slide_text(slide) for slide in prs.slides)
+
+    assert "Вопрос." in text
+    assert "Ответ [оставить]." in text
+    assert "Зачет [оставить]." in text
+    assert "Незачет." in text
+    assert "Комментарий." in text
+    assert "[убрать]" not in text
 
 
 def test_title_slide_uses_full_height_centered_textbox(tmp_path):

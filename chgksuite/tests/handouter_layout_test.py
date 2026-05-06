@@ -19,7 +19,14 @@ from pypdf.generic import (
 
 from chgksuite.handouter import utils as handouter_utils
 from chgksuite.handouter.runner import HandoutGenerator
-from chgksuite.handouter.split_fit import pdf_bottom_space_mm
+from chgksuite.handouter.split_fit import (
+    HandoutBlock,
+    all_q_block_text,
+    parse_blocks,
+    pdf_bottom_space_mm,
+    split_fit_columns,
+    write_handout,
+)
 from chgksuite.handouter.tex_internals import EDGE_SOLID, EDGE_NONE
 from chgksuite.handouter.utils import (
     optimize_raster_image_for_tex,
@@ -335,10 +342,72 @@ test"""
         result = parse_handouts(contents)
         assert "grouping" not in result[0]
 
+    def test_parse_max_width(self):
+        """Parse max_width as a floating-point metadata value."""
+        contents = """columns: 3
+max_width: 0.5
+test"""
+        result = parse_handouts(contents)
+        assert result[0]["max_width"] == 0.5
+        assert "max_width" not in result[0]["text"]
+
+    def test_split_fit_parse_max_width_as_metadata(self):
+        """split_fit should preserve max_width as metadata, not handout text."""
+        contents = """columns: 3
+max_width: 0.5
+test"""
+        result = parse_blocks(contents)
+        assert result[0].meta["max_width"] == "0.5"
+
     def test_wrap_val_grouping_invalid(self):
         """Invalid grouping value should raise ValueError."""
         with pytest.raises(ValueError, match="Invalid grouping value"):
             wrap_val("grouping", "diagonal")
+
+
+class TestMaxWidthLayout:
+    def test_max_width_limits_auto_box_width(self, generator):
+        tex = generator.generate_regular_block(
+            {"columns": 3, "rows": 1, "max_width": 0.5, "text": "test"}
+        )
+
+        assert r"\setlength{\boxwidth}{32.0mm}%" in tex
+        assert r"\setlength{\boxwidthinner}{30.0mm}%" in tex
+
+    def test_invalid_max_width_raises(self, generator):
+        with pytest.raises(ValueError, match="max_width must be between 0 and 1"):
+            generator.generate_regular_block(
+                {"columns": 3, "max_width": 1.5, "text": "test"}
+            )
+
+    def test_split_fit_multiplies_half_width_columns(self, tmp_path):
+        block = HandoutBlock(
+            ordinal=1,
+            text="columns: 3\nmax_width: 0.5\n\nhandout",
+            meta={"columns": "3", "max_width": "0.5"},
+        )
+        output_path = tmp_path / "out.hndt"
+
+        write_handout(block, output_path, rows=4, source_dir=tmp_path)
+
+        contents = output_path.read_text(encoding="utf8")
+        assert split_fit_columns(block) == 6
+        assert "columns: 6" in contents
+        assert "rows: 4" in contents
+        assert "max_width:" not in contents
+
+    def test_split_fit_all_q_keeps_half_width_for_one_team_mode(self, tmp_path):
+        block = HandoutBlock(
+            ordinal=1,
+            text="columns: 3\nmax_width: 0.5\n\nhandout",
+            meta={"columns": "3", "max_width": "0.5"},
+        )
+
+        contents = all_q_block_text(block, tmp_path, tmp_path, None)
+
+        assert "columns: 3" in contents
+        assert "max_width: 0.5" in contents
+        assert "rows: 1" in contents
 
 
 def test_optimize_raster_image_for_tex_recompresses_png(tmp_path):

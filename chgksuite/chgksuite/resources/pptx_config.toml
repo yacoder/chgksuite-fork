@@ -2,6 +2,7 @@ template_path = "template.pptx"
 template_version = 2
 disable_shrink_fit = false
 overlay_image_and_text = false
+format_links = true
 add_plug = true
 add_comment = true
 add_zachet = true

@@ -10,10 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 import zipfile
 from io import BytesIO
-import xml.etree.ElementTree as ET
 
 import pytest
 import chgksuite.parser as parser_module
@@ -34,7 +32,6 @@ from chgksuite.composer.docx import (
     DocxExporter,
     add_hyperlink_to_docx,
     add_text_run_to_docx,
-    embed_fonts_in_docx,
     optimize_docx_images,
     remove_square_brackets_standalone,
 )
@@ -850,208 +847,6 @@ def test_docx_non_breaking_hyphen_uses_word_joiners(tmp_path):
     assert "В 50\u2060-\u2060е годы" in document
 
 
-def _write_test_ttf(
-    path,
-    family="Test Embed",
-    subfamily="Regular",
-    characters="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .?!:",
-):
-    from fontTools.fontBuilder import FontBuilder
-    from fontTools.pens.ttGlyphPen import TTGlyphPen
-
-    full_name = f"{family} {subfamily}".strip()
-    cmap = {}
-    glyph_order = [".notdef"]
-    for char in sorted(set(characters)):
-        glyph_name = f"uni{ord(char):04X}"
-        cmap[ord(char)] = glyph_name
-        glyph_order.append(glyph_name)
-
-    glyphs = {}
-    metrics = {}
-    for glyph_name in glyph_order:
-        pen = TTGlyphPen(None)
-        if glyph_name != ".notdef" and glyph_name != "uni0020":
-            pen.moveTo((80, 0))
-            pen.lineTo((440, 0))
-            pen.lineTo((440, 700))
-            pen.lineTo((80, 700))
-            pen.closePath()
-        glyphs[glyph_name] = pen.glyph()
-        metrics[glyph_name] = (520, 0)
-
-    builder = FontBuilder(1000, isTTF=True)
-    builder.setupGlyphOrder(glyph_order)
-    builder.setupCharacterMap(cmap)
-    builder.setupGlyf(glyphs)
-    builder.setupHorizontalMetrics(metrics)
-    builder.setupHorizontalHeader(ascent=800, descent=-200)
-    builder.setupOS2()
-    builder.setupNameTable(
-        {
-            "familyName": family,
-            "styleName": subfamily,
-            "uniqueFontIdentifier": full_name,
-            "fullName": full_name,
-            "psName": re.sub(r"[^A-Za-z0-9]", "", full_name),
-        }
-    )
-    builder.setupPost()
-    builder.setupMaxp()
-    builder.save(path)
-
-
-def test_embed_fonts_in_docx_embeds_obfuscated_regular_font(tmp_path):
-    from docx import Document
-
-    font_path = tmp_path / "TestEmbed-Regular.ttf"
-    _write_test_ttf(font_path)
-    docx_path = tmp_path / "test.docx"
-    Document().save(docx_path)
-
-    embed_fonts_in_docx(docx_path, str(font_path), font_name="Test Embed")
-
-    with zipfile.ZipFile(docx_path) as docx_file:
-        content_types = docx_file.read("[Content_Types].xml").decode("utf-8")
-        font_rels = docx_file.read("word/_rels/fontTable.xml.rels").decode("utf-8")
-        font_table = ET.fromstring(docx_file.read("word/fontTable.xml"))
-        settings = ET.fromstring(docx_file.read("word/settings.xml"))
-        rels = ET.fromstring(font_rels)
-
-        w_name = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}name"
-        font_el = next(
-            element
-            for element in font_table
-            if element.tag.endswith("font") and element.get(w_name) == "Test Embed"
-        )
-        embed_regular = font_el.find(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}embedRegular"
-        )
-        rel_id = embed_regular.get(
-            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-        )
-        font_key = embed_regular.get(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fontKey"
-        )
-        rel = next(element for element in rels if element.get("Id") == rel_id)
-        embedded_font = docx_file.read("word/" + rel.get("Target"))
-
-    assert "application/vnd.openxmlformats-officedocument.obfuscatedFont" in content_types
-    assert "<ns0:" not in content_types
-    assert "<ns0:" not in font_rels
-    assert rel.get("Type").endswith("/font")
-    assert any(element.tag.endswith("embedTrueTypeFonts") for element in settings.iter())
-
-    deobfuscated = bytearray(embedded_font)
-    key = uuid.UUID(font_key.strip("{}")).bytes[::-1]
-    for index in range(32):
-        deobfuscated[index] ^= key[index % len(key)]
-    assert bytes(deobfuscated[:32]) == font_path.read_bytes()[:32]
-
-
-def test_embed_fonts_in_docx_subsets_to_used_characters(tmp_path):
-    from docx import Document
-    from fontTools.ttLib import TTFont
-
-    font_path = tmp_path / "TestEmbed-Regular.ttf"
-    _write_test_ttf(font_path, characters="ABC")
-    docx_path = tmp_path / "test.docx"
-    Document().save(docx_path)
-
-    embed_fonts_in_docx(
-        docx_path,
-        str(font_path),
-        font_name="Test Embed",
-        subset_characters=set("AB"),
-    )
-
-    with zipfile.ZipFile(docx_path) as docx_file:
-        font_table = ET.fromstring(docx_file.read("word/fontTable.xml"))
-        settings = ET.fromstring(docx_file.read("word/settings.xml"))
-        rels = ET.fromstring(docx_file.read("word/_rels/fontTable.xml.rels"))
-        embed_regular = next(
-            element
-            for element in font_table.iter()
-            if element.tag.endswith("embedRegular")
-        )
-        rel_id = embed_regular.get(
-            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-        )
-        font_key = embed_regular.get(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fontKey"
-        )
-        rel = next(element for element in rels if element.get("Id") == rel_id)
-        embedded_font = bytearray(docx_file.read("word/" + rel.get("Target")))
-
-    key = uuid.UUID(font_key.strip("{}")).bytes[::-1]
-    for index in range(32):
-        embedded_font[index] ^= key[index % len(key)]
-
-    subset_font = TTFont(BytesIO(bytes(embedded_font)))
-    cmap = subset_font.getBestCmap()
-    subset_font.close()
-    assert 65 in cmap
-    assert 66 in cmap
-    assert 67 not in cmap
-    assert any(element.tag.endswith("saveSubsetFonts") for element in settings.iter())
-
-
-def test_embed_fonts_in_pptx_embeds_subset_font_data(tmp_path):
-    import struct
-
-    from fontTools.ttLib import TTFont
-    from pptx import Presentation
-
-    from chgksuite.composer.pptx import embed_fonts_in_pptx
-
-    font_path = tmp_path / "TestEmbed-Regular.ttf"
-    _write_test_ttf(font_path, characters="ABC")
-    pptx_path = tmp_path / "test.pptx"
-    prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    slide.shapes.add_textbox(0, 0, 1000, 1000).text = "AB"
-    prs.save(pptx_path)
-
-    embed_fonts_in_pptx(
-        pptx_path,
-        str(font_path),
-        font_name="Test Embed",
-        subset_characters=set("AB"),
-    )
-
-    with zipfile.ZipFile(pptx_path) as pptx_file:
-        content_types = pptx_file.read("[Content_Types].xml").decode("utf-8")
-        presentation = ET.fromstring(pptx_file.read("ppt/presentation.xml"))
-        rels = ET.fromstring(pptx_file.read("ppt/_rels/presentation.xml.rels"))
-        embedded_font = next(
-            element for element in presentation.iter() if element.tag.endswith("embeddedFont")
-        )
-        font_el = next(element for element in embedded_font if element.tag.endswith("font"))
-        regular_el = next(
-            element for element in embedded_font if element.tag.endswith("regular")
-        )
-        rel_id = regular_el.get(
-            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-        )
-        rel = next(element for element in rels if element.get("Id") == rel_id)
-        eot_data = pptx_file.read("ppt/" + rel.get("Target"))
-
-    eot_size, font_size, version, flags = struct.unpack_from("<IIII", eot_data)
-    assert font_el.get("typeface") == "Test Embed"
-    assert rel.get("Type").endswith("/font")
-    assert "application/x-fontdata" in content_types
-    assert eot_size == len(eot_data)
-    assert version == 0x00020001
-    assert flags == 1
-
-    subset_font = TTFont(BytesIO(eot_data[-font_size:]))
-    cmap = subset_font.getBestCmap()
-    subset_font.close()
-    assert 65 in cmap
-    assert 66 in cmap
-    assert 67 not in cmap
-
-
 def test_optimize_docx_images_recompresses_png_as_jpeg(tmp_path):
     from docx import Document
 
@@ -1143,16 +938,14 @@ def test_optimize_raster_image_data_preserves_transparent_png():
         assert optimized_image.convert("RGBA").getchannel("A").getextrema()[0] < 255
 
 
-def test_docx_exporter_embeds_font_from_font_argument(tmp_path):
-    font_path = tmp_path / "TestEmbed-Regular.ttf"
-    _write_test_ttf(font_path)
+def test_docx_exporter_uses_font_argument(tmp_path):
     output_path = tmp_path / "exported.docx"
     args = DefaultArgs(
         docx_template=os.path.join(parentdir, "chgksuite", "resources", "template.docx"),
-        embed_fonts="on",
-        font=str(font_path),
+        font="Test Embed",
         game="chgk",
         regexes_file=os.path.join(parentdir, "chgksuite", "resources", "regexes_ru.json"),
+        optimize_size="off",
         spoilers="off",
         screen_mode="off",
     )
@@ -1165,14 +958,53 @@ def test_docx_exporter_embeds_font_from_font_argument(tmp_path):
     exporter.export(output_path)
 
     with zipfile.ZipFile(output_path) as docx_file:
-        assert any(name.startswith("word/fonts/") for name in docx_file.namelist())
+        assert not any(name.startswith("word/fonts/") for name in docx_file.namelist())
         font_table = docx_file.read("word/fontTable.xml").decode("utf-8")
 
     assert "Test Embed" in font_table
-    assert "embedRegular" in font_table
 
 
-def test_docx_cli_accepts_font_and_embed_fonts():
+def test_docx_screen_mode_preserves_zachet_brackets(tmp_path):
+    from docx import Document
+
+    output_path = tmp_path / "screen.docx"
+    args = DefaultArgs(
+        docx_template=os.path.join(parentdir, "chgksuite", "resources", "template.docx"),
+        game="chgk",
+        regexes_file=os.path.join(parentdir, "chgksuite", "resources", "regexes_ru.json"),
+        optimize_size="off",
+        spoilers="off",
+        screen_mode="replace_all",
+    )
+    exporter = DocxExporter(
+        [
+            (
+                "Question",
+                {
+                    "question": "Вопрос [убрать].",
+                    "answer": "Ответ [оставить].",
+                    "zachet": "Зачет [оставить].",
+                    "nezachet": "Незачет [убрать].",
+                    "comment": "Комментарий [убрать].",
+                },
+            )
+        ],
+        args,
+        {"tmp_dir": str(tmp_path), "targetdir": str(tmp_path)},
+    )
+    exporter.export(output_path)
+
+    text = "\n".join(paragraph.text for paragraph in Document(output_path).paragraphs)
+
+    assert "Вопрос." in text
+    assert "Ответ [оставить]." in text
+    assert "Зачет [оставить]." in text
+    assert "Незачет." in text
+    assert "Комментарий." in text
+    assert "[убрать]" not in text
+
+
+def test_docx_cli_accepts_font():
     import argparse
 
     from chgksuite.cli import ArgparseBuilder
@@ -1180,9 +1012,7 @@ def test_docx_cli_accepts_font_and_embed_fonts():
     parser = argparse.ArgumentParser(prog="chgksuite")
     ArgparseBuilder(parser, False).build()
 
-    args = parser.parse_args(
-        ["compose", "docx", "--font", "Test Embed", "--embed_fonts", "on", "test.4s"]
-    )
+    args = parser.parse_args(["compose", "docx", "--font", "Test Embed", "test.4s"])
     legacy_args = parser.parse_args(
         [
             "compose",
@@ -1196,19 +1026,15 @@ def test_docx_cli_accepts_font_and_embed_fonts():
     )
 
     assert args.font == "Test Embed"
-    assert args.embed_fonts == "on"
     assert args.optimize_size == "on"
     assert legacy_args.font == "Legacy Font"
     assert legacy_args.optimize_size == "off"
 
-    pptx_args = parser.parse_args(
-        ["compose", "pptx", "--font", "Test PPT", "--embed_fonts", "on", "test.4s"]
-    )
+    pptx_args = parser.parse_args(["compose", "pptx", "--font", "Test PPT", "test.4s"])
     pptx_no_optimize_args = parser.parse_args(
         ["compose", "pptx", "--optimize_size", "off", "test.4s"]
     )
     assert pptx_args.font == "Test PPT"
-    assert pptx_args.embed_fonts == "on"
     assert pptx_args.optimize_size == "on"
     assert pptx_no_optimize_args.optimize_size == "off"
 

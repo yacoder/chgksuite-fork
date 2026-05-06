@@ -33,6 +33,7 @@ RESERVED_WORDS = [
     "tikz_mm",
     "hspace",
     "vspace",
+    "max_width",
 ]
 
 
@@ -521,7 +522,14 @@ def replace_ext(filepath, new_ext):
 def wrap_val(key, val):
     if key in ("columns", "rows", "no_center", "color", "handouts_per_team"):
         return int(val.strip())
-    if key in ("resize_image", "font_size", "tikz_mm", "hspace", "vspace"):
+    if key in (
+        "resize_image",
+        "font_size",
+        "tikz_mm",
+        "hspace",
+        "vspace",
+        "max_width",
+    ):
         return float(val.strip())
     if key == "grouping":
         val = val.strip().lower()

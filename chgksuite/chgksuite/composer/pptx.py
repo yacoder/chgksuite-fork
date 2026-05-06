@@ -3,16 +3,11 @@ import functools
 import math
 import os
 import re
-import struct
-import tempfile
 import urllib.parse
-import zipfile
-import xml.etree.ElementTree as ET
 
 import toml
 
 from chgksuite.common import (
-    _rewrite_zip_package,
     log_wrap,
     optimize_ooxml_images,
     replace_escaped,
@@ -28,13 +23,7 @@ from chgksuite.composer.docx import (
     _HYPERLINK_SAFE_CHARS,
     _docx_font_name,
     _docx_font_spec,
-    _embed_fonts_enabled,
-    _ensure_content_type_override,
-    _load_xml_part,
-    _next_relationship_id,
     _select_font_faces,
-    _subset_font_faces,
-    _xml_bytes,
 )
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -45,39 +34,12 @@ from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
 
 
-_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
-_FONTDATA_CONTENT_TYPE = "application/x-fontdata"
-_FONT_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/font"
-_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
-_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
-_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _PPTX_HYPERLINK_COLOR = (0x05, 0x63, 0xC1)
 _EMU_PER_INCH = 914400
 _PX_PER_INCH = 96
 _PT_PER_INCH = 72
-_PPTX_FONT_TAGS = {
-    "regular": "regular",
-    "bold": "bold",
-    "italic": "italic",
-    "bold_italic": "boldItalic",
-}
-_PPTX_PRESENTATION_INSERT_BEFORE = {
-    f"{{{_P_NS}}}custShowLst",
-    f"{{{_P_NS}}}photoAlbum",
-    f"{{{_P_NS}}}custDataLst",
-    f"{{{_P_NS}}}kinsoku",
-    f"{{{_P_NS}}}defaultTextStyle",
-    f"{{{_P_NS}}}modifyVerifier",
-    f"{{{_P_NS}}}extLst",
-}
-_PPTX_TEXT_TAGS = {f"{{{_A_NS}}}t"}
 _PPTX_URL_BREAK_AFTER_CHARS = "/.-_\u2011?&=%#:"
 _PPTX_URL_RE = re.compile(r"https?://|www\.")
-
-ET.register_namespace("a", _A_NS)
-ET.register_namespace("p", _P_NS)
-ET.register_namespace("r", _R_NS)
 
 
 @functools.lru_cache(maxsize=256)
@@ -101,268 +63,6 @@ def _get_pptx_handout_text_space_after(handout_cfg):
     return handout_cfg.get("text_space_after", handout_cfg.get("space_after", 18))
 
 
-def _next_pptx_font_part_name(existing_names, extension=".fntdata"):
-    index = 1
-    while f"ppt/fonts/font{index}{extension}" in existing_names:
-        index += 1
-    return f"ppt/fonts/font{index}{extension}"
-
-
-def _pptx_relationship_target_for_part(part_name):
-    return os.path.relpath(part_name, "ppt").replace(os.sep, "/")
-
-
-def _utf16le_bytes(text):
-    return (text or "").encode("utf-16le")
-
-
-def _font_panose_bytes(os2_table):
-    panose = getattr(os2_table, "panose", None)
-    if panose is None:
-        return b"\x00" * 10
-    fields = (
-        "bFamilyType",
-        "bSerifStyle",
-        "bWeight",
-        "bProportion",
-        "bContrast",
-        "bStrokeVariation",
-        "bArmStyle",
-        "bLetterForm",
-        "bMidline",
-        "bXHeight",
-    )
-    return bytes(getattr(panose, field, 0) & 0xFF for field in fields)
-
-
-def _eot_font_metadata(font_path, face):
-    from fontTools.ttLib import TTFont
-
-    font = TTFont(font_path, lazy=True)
-    try:
-        os2_table = font.get("OS/2")
-        head_table = font.get("head")
-        name_table = font.get("name")
-        return {
-            "panose": _font_panose_bytes(os2_table) if os2_table else b"\x00" * 10,
-            "charset": 1,
-            "italic": int(bool(os2_table and (os2_table.fsSelection & 0x01))),
-            "weight": getattr(os2_table, "usWeightClass", 400) if os2_table else 400,
-            "fs_type": getattr(os2_table, "fsType", 0) if os2_table else 0,
-            "unicode_ranges": tuple(
-                getattr(os2_table, f"ulUnicodeRange{index}", 0)
-                for index in range(1, 5)
-            )
-            if os2_table
-            else (0, 0, 0, 0),
-            "code_page_ranges": (
-                getattr(os2_table, "ulCodePageRange1", 0) if os2_table else 0,
-                getattr(os2_table, "ulCodePageRange2", 0) if os2_table else 0,
-            ),
-            "checksum_adjustment": getattr(head_table, "checkSumAdjustment", 0),
-            "family": face.family,
-            "style": face.subfamily or "Regular",
-            "version": name_table.getDebugName(5) if name_table else "",
-            "full_name": face.full_name or face.family,
-        }
-    finally:
-        font.close()
-
-
-def _font_file_to_eot_bytes(font_path, face, subset=False):
-    with open(font_path, "rb") as font_file:
-        font_data = font_file.read()
-    metadata = _eot_font_metadata(font_path, face)
-    family = _utf16le_bytes(metadata["family"])
-    style = _utf16le_bytes(metadata["style"])
-    version = _utf16le_bytes(metadata["version"])
-    full_name = _utf16le_bytes(metadata["full_name"])
-
-    flags = 0x0001 if subset else 0
-    string_payload = b"".join(
-        (
-            family,
-            struct.pack("<H", 0),
-            struct.pack("<H", len(style)),
-            style,
-            struct.pack("<H", 0),
-            struct.pack("<H", len(version)),
-            version,
-            struct.pack("<H", 0),
-            struct.pack("<H", len(full_name)),
-            full_name,
-            struct.pack("<H", 0),
-            struct.pack("<H", 0),
-        )
-    )
-    eot_size = 84 + len(string_payload) + len(font_data)
-    header = struct.pack(
-        "<IIII10sBBIHHIIIIIIIIIIIHH",
-        eot_size,
-        len(font_data),
-        0x00020001,
-        flags,
-        metadata["panose"],
-        metadata["charset"],
-        metadata["italic"],
-        metadata["weight"],
-        metadata["fs_type"],
-        0x504C,
-        *metadata["unicode_ranges"],
-        *metadata["code_page_ranges"],
-        metadata["checksum_adjustment"],
-        0,
-        0,
-        0,
-        0,
-        0,
-        len(family),
-    )
-    return header + string_payload + font_data
-
-
-def _get_or_create_embedded_font_list(presentation_root):
-    embedded_font_list = presentation_root.find(f"{{{_P_NS}}}embeddedFontLst")
-    if embedded_font_list is not None:
-        return embedded_font_list
-
-    embedded_font_list = ET.Element(f"{{{_P_NS}}}embeddedFontLst")
-    for index, child in enumerate(list(presentation_root)):
-        if child.tag in _PPTX_PRESENTATION_INSERT_BEFORE:
-            presentation_root.insert(index, embedded_font_list)
-            break
-    else:
-        presentation_root.append(embedded_font_list)
-    return embedded_font_list
-
-
-def _remove_embedded_font_entry(embedded_font_list, font_name):
-    for embedded_font in list(
-        embedded_font_list.findall(f"{{{_P_NS}}}embeddedFont")
-    ):
-        font_el = embedded_font.find(f"{{{_P_NS}}}font")
-        if font_el is not None and font_el.get("typeface") == font_name:
-            embedded_font_list.remove(embedded_font)
-
-
-def collect_pptx_used_characters(pptx_path):
-    characters = set()
-    visible_xml_prefixes = (
-        "ppt/slides/",
-        "ppt/notesSlides/",
-        "ppt/slideMasters/",
-        "ppt/slideLayouts/",
-    )
-
-    with zipfile.ZipFile(pptx_path, "r") as pptx_zip:
-        for name in pptx_zip.namelist():
-            if not name.startswith(visible_xml_prefixes) or not name.endswith(".xml"):
-                continue
-            try:
-                root = ET.fromstring(pptx_zip.read(name))
-            except ET.ParseError:
-                continue
-            for element in root.iter():
-                if element.tag in _PPTX_TEXT_TAGS and element.text:
-                    characters.update(element.text)
-    return characters
-
-
-def embed_fonts_in_pptx(
-    pptx_path,
-    font_spec,
-    font_name=None,
-    font_faces=None,
-    search_dirs=None,
-    subset_characters=None,
-):
-    if not font_spec:
-        raise ValueError("--embed_fonts=on requires --font.")
-
-    font_faces = font_faces or _select_font_faces(font_spec, search_dirs=search_dirs)
-    font_name = font_name or _docx_font_name(font_spec, font_faces)
-    subset_tmp_dir = None
-    subset = subset_characters is not None
-    if subset:
-        subset_tmp_dir = tempfile.TemporaryDirectory()
-        font_faces = _subset_font_faces(
-            font_faces, subset_characters, subset_tmp_dir.name
-        )
-
-    try:
-        with zipfile.ZipFile(pptx_path, "r") as pptx_zip:
-            existing_names = set(pptx_zip.namelist())
-            content_types_root = _load_xml_part(
-                pptx_zip,
-                "[Content_Types].xml",
-                ET.Element(f"{{{_CONTENT_TYPES_NS}}}Types"),
-            )
-            presentation_root = _load_xml_part(
-                pptx_zip,
-                "ppt/presentation.xml",
-                ET.Element(f"{{{_P_NS}}}presentation"),
-            )
-            rels_root = _load_xml_part(
-                pptx_zip,
-                "ppt/_rels/presentation.xml.rels",
-                ET.Element(f"{{{_PACKAGE_REL_NS}}}Relationships"),
-            )
-
-        replacements = {}
-        font_relationships = {}
-        for role, face in font_faces.items():
-            part_name = _next_pptx_font_part_name(existing_names)
-            existing_names.add(part_name)
-            rel_id = _next_relationship_id(rels_root)
-            ET.SubElement(
-                rels_root,
-                f"{{{_PACKAGE_REL_NS}}}Relationship",
-                {
-                    "Id": rel_id,
-                    "Type": _FONT_REL_TYPE,
-                    "Target": _pptx_relationship_target_for_part(part_name),
-                },
-            )
-            _ensure_content_type_override(
-                content_types_root, f"/{part_name}", _FONTDATA_CONTENT_TYPE
-            )
-            replacements[part_name] = _font_file_to_eot_bytes(
-                face.path, face, subset=subset
-            )
-            font_relationships[role] = rel_id
-
-        embedded_font_list = _get_or_create_embedded_font_list(presentation_root)
-        _remove_embedded_font_entry(embedded_font_list, font_name)
-        embedded_font = ET.SubElement(embedded_font_list, f"{{{_P_NS}}}embeddedFont")
-        ET.SubElement(embedded_font, f"{{{_P_NS}}}font", {"typeface": font_name})
-        for role in ("regular", "bold", "italic", "bold_italic"):
-            if role not in font_relationships:
-                continue
-            ET.SubElement(
-                embedded_font,
-                f"{{{_P_NS}}}{_PPTX_FONT_TAGS[role]}",
-                {f"{{{_R_NS}}}id": font_relationships[role]},
-            )
-
-        presentation_root.set("saveSubsetFonts", "1" if subset else "0")
-        replacements.update(
-            {
-                "[Content_Types].xml": _xml_bytes(
-                    content_types_root, default_namespace=_CONTENT_TYPES_NS
-                ),
-                "ppt/presentation.xml": _xml_bytes(presentation_root),
-                "ppt/_rels/presentation.xml.rels": _xml_bytes(
-                    rels_root, default_namespace=_PACKAGE_REL_NS
-                ),
-            }
-        )
-        _rewrite_zip_package(pptx_path, replacements)
-        return font_faces
-    finally:
-        if subset_tmp_dir is not None:
-            subset_tmp_dir.cleanup()
-
-
 class PptxExporter(BaseExporter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -372,11 +72,7 @@ class PptxExporter(BaseExporter):
         self.font_spec = _docx_font_spec(self.args)
         self.font_faces = None
         self.optimize_size = _optimize_size_enabled(self.args)
-        if _embed_fonts_enabled(self.args):
-            if not self.font_spec:
-                raise ValueError("--embed_fonts=on requires --font.")
-            self.font_faces = _select_font_faces(self.font_spec)
-        self.font_name = _docx_font_name(self.font_spec, self.font_faces)
+        self.font_name = _docx_font_name(self.font_spec)
         self._measurement_font_faces = None
         if self.font_name:
             font_cfg = self.c.setdefault("font", {})
@@ -1064,6 +760,9 @@ class PptxExporter(BaseExporter):
     def _get_handout_image_scale(self):
         return self.c.get("handout", {}).get("image_scale", 1)
 
+    def _format_links_enabled(self):
+        return self.c.get("format_links", True)
+
     def _get_image_space_after(self, image):
         if image.get("handout"):
             return PptxPt(self._get_handout_space_after())
@@ -1158,6 +857,8 @@ class PptxExporter(BaseExporter):
         return runs
 
     def add_hyperlink_runs(self, para, text, url):
+        if not self._format_links_enabled():
+            return self.add_runs(para, text)
         hyperlink_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
         runs = self.add_runs(para, text)
         for run in runs:
@@ -1755,7 +1456,7 @@ class PptxExporter(BaseExporter):
     def _get_answer_grid_text(self, q, fields):
         result = []
         for field in fields:
-            strip_brackets = field not in ("answer", "zachet", "nezachet")
+            strip_brackets = field not in ("answer", "zachet")
             value = self.pptx_process_text(
                 copy.deepcopy(q[field]), strip_brackets=strip_brackets
             )
@@ -1810,7 +1511,7 @@ class PptxExporter(BaseExporter):
             r.font.bold = True
             self.pptx_format(zachet_text, p, tf, slide)
         if q.get("nezachet") and self.c.get("add_zachet"):
-            nezachet_text = self.pptx_process_text(q["nezachet"], strip_brackets=False)
+            nezachet_text = self.pptx_process_text(q["nezachet"])
             r = self.add_run(p, f"\n{self.get_label(q, 'nezachet')}: ")
             r.font.bold = True
             self.pptx_format(nezachet_text, p, tf, slide)
@@ -1896,17 +1597,6 @@ class PptxExporter(BaseExporter):
         self._add_service_slides("final")
         self._remove_service_slide_templates()
         self.prs.save(outfilename)
-        subset_characters = None
         if self.optimize_size:
-            if _embed_fonts_enabled(self.args):
-                subset_characters = collect_pptx_used_characters(outfilename)
             optimize_pptx_images(outfilename, quality=80)
-        if _embed_fonts_enabled(self.args):
-            embed_fonts_in_pptx(
-                outfilename,
-                self.font_spec,
-                font_name=self.font_name,
-                font_faces=self.font_faces,
-                subset_characters=subset_characters,
-            )
         self.logger.info("Output: {}".format(outfilename))
