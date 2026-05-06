@@ -38,6 +38,7 @@ RESERVED_WORDS = {
     "tikz_mm",
     "hspace",
     "vspace",
+    "max_width",
 }
 
 TECTONIC_LOCK = Lock()
@@ -175,7 +176,23 @@ def valid_row_step(columns: int, n_per_team: int) -> int:
     return n_per_team // math.gcd(columns, n_per_team)
 
 
-def upsert_metadata(block: HandoutBlock, updates: dict[str, str]) -> str:
+def block_max_width(block: HandoutBlock) -> float:
+    max_width = parse_positive_float(block.meta.get("max_width"), "max_width", 1.0)
+    if max_width > 1:
+        raise ValueError(f"`max_width` must be <= 1, got {max_width}")
+    return max_width
+
+
+def max_width_column_multiplier(block: HandoutBlock) -> int:
+    return max(1, math.floor(1.0 / block_max_width(block) + 1e-9))
+
+
+def split_fit_columns(block: HandoutBlock) -> int:
+    columns = parse_positive_int(block.meta.get("columns"), "columns")
+    return columns * max_width_column_multiplier(block)
+
+
+def upsert_metadata(block: HandoutBlock, updates: dict[str, str | None]) -> str:
     lines = block.text.splitlines()
     output: list[str] = []
     updated = set()
@@ -185,12 +202,15 @@ def upsert_metadata(block: HandoutBlock, updates: dict[str, str]) -> str:
         if parsed and parsed[0] in updates:
             key = parsed[0]
             if key not in updated:
-                output.append(f"{key}: {updates[key]}")
+                if updates[key] is not None:
+                    output.append(f"{key}: {updates[key]}")
                 updated.add(key)
             continue
         output.append(line)
 
-    missing = [key for key in updates if key not in updated]
+    missing = [
+        key for key, value in updates.items() if key not in updated and value is not None
+    ]
     if missing:
         insert_at = 0
         for idx, line in enumerate(output):
@@ -222,7 +242,12 @@ def write_handout(
     source_dir: Path,
     resize_image: float | None = None,
 ) -> None:
-    updates = {"rows": str(rows)}
+    updates: dict[str, str | None] = {"rows": str(rows)}
+    multiplier = max_width_column_multiplier(block)
+    if multiplier > 1:
+        columns = parse_positive_int(block.meta.get("columns"), "columns")
+        updates["columns"] = str(columns * multiplier)
+        updates["max_width"] = None
     if resize_image is not None:
         updates["resize_image"] = format_float(resize_image)
     image_update = source_relative_image_update(block, source_dir, output_path.parent)
@@ -607,7 +632,7 @@ def best_rows_for_block(
     resize_image: float | None = None,
     log: Callable[[str], None] | None = None,
 ) -> int:
-    columns = parse_positive_int(block.meta.get("columns"), "columns")
+    columns = split_fit_columns(block)
     n_per_team = parse_positive_int(
         block.meta.get("handouts_per_team"), "handouts_per_team", default=3
     )
@@ -950,7 +975,7 @@ def fit_block(
             verbose=verbose,
             log=logs.append,
         )
-        columns = parse_positive_int(block.meta.get("columns"), "columns")
+        columns = split_fit_columns(block)
         n_per_team = parse_positive_int(
             block.meta.get("handouts_per_team"),
             "handouts_per_team",
@@ -1002,7 +1027,9 @@ def print_block_result(result: BlockFitResult) -> None:
     )
 
 
-def updates_for_resize(block: HandoutBlock, resize_image: float | None) -> dict[str, str]:
+def updates_for_resize(
+    block: HandoutBlock, resize_image: float | None
+) -> dict[str, str | None]:
     resize_update = resize_update_for_block(block, resize_image)
     if resize_update is None:
         return {}
