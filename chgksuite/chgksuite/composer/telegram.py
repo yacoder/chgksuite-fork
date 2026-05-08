@@ -15,6 +15,7 @@ import toml
 from PIL import Image, ImageOps
 
 from chgksuite.common import (
+    HYPERLINK_SAFE_CHARS,
     get_chgksuite_dir,
     init_logger,
     load_settings,
@@ -72,11 +73,8 @@ def tg_entity_count(html):
     return len(_TG_ENTITY_RE.findall(html))
 
 
-_TG_HREF_SAFE_CHARS = "%/:?#[]@!$&'()*+,;="
-
-
 def _format_html_hyperlink(url, disable_asterisks_processing=False):
-    href = urllib.parse.quote(url, safe=_TG_HREF_SAFE_CHARS)
+    href = urllib.parse.quote(url, safe=HYPERLINK_SAFE_CHARS)
     href = html.escape(href, quote=True)
     text = html.escape(url, quote=False).replace("_", "&#95;")
     if not disable_asterisks_processing:

@@ -13,8 +13,11 @@ from pptx.enum.text import MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 from pptx.util import Inches as PptxInches
 from pptx.util import Pt as PptxPt
 
-from chgksuite.common import DefaultArgs
-from chgksuite.composer.docx import _HYPERLINK_SAFE_CHARS
+from chgksuite.common import (
+    DefaultArgs,
+    HYPERLINK_SAFE_CHARS,
+    NO_BREAK_HYPHEN_REPLACEMENT,
+)
 from chgksuite.composer.pptx import PptxExporter, optimize_pptx_images
 
 
@@ -247,7 +250,7 @@ def test_pptx_exporter_can_disable_size_optimization(tmp_path, monkeypatch):
 
 def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
     url = "https://example.com/ик-с?q=тест"
-    encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+    encoded_url = urllib.parse.quote(url, safe=HYPERLINK_SAFE_CHARS)
     pptx_path = _export_pptx_path(
         tmp_path,
         [
@@ -299,7 +302,7 @@ def test_pptx_hyperlinks_are_clickable_and_styled(tmp_path):
 
 def test_pptx_can_disable_hyperlink_formatting(tmp_path):
     url = "https://example.com/ик-с?q=тест"
-    encoded_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+    encoded_url = urllib.parse.quote(url, safe=HYPERLINK_SAFE_CHARS)
     pptx_path = _export_pptx_path(
         tmp_path,
         [
@@ -386,6 +389,31 @@ def test_pptx_block_metadata_hyperlinks_are_clickable_and_styled(tmp_path):
     ) in rels_xml
     assert f'Target="{url}"' in rels_xml
     assert 'TargetMode="External"' in rels_xml
+
+
+def test_pptx_non_breaking_hyphen_uses_word_joiners(tmp_path):
+    pptx_path = _export_pptx_path(
+        tmp_path,
+        [
+            (
+                "Question",
+                {
+                    "question": "В 50\u2011е годы.",
+                    "answer": "Ответ.",
+                },
+            ),
+        ],
+    )
+
+    with zipfile.ZipFile(pptx_path) as pptx_file:
+        slide_xml = "\n".join(
+            pptx_file.read(name).decode("utf-8")
+            for name in pptx_file.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        )
+
+    assert "\u2011" not in slide_xml
+    assert f"50{NO_BREAK_HYPHEN_REPLACEMENT}е годы" in slide_xml
 
 
 def test_pptx_export_preserves_zachet_brackets(tmp_path):
