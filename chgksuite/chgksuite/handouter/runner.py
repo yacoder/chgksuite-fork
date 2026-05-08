@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -35,6 +36,10 @@ from chgksuite.handouter.utils import (
     replace_ext,
     write_file,
 )
+
+
+def tex_image_path(image_path):
+    return r"\detokenize{" + str(image_path).replace("\\", "/") + "}"
 
 
 def rotate_image(image_path, direction):
@@ -438,7 +443,9 @@ class HandoutGenerator:
             img_qwidth = block.get("resize_image") or 1.0
             imgwidth = IMGWIDTH.replace("<QWIDTH>", str(img_qwidth))
             contents.append(
-                IMG.replace("<IMGPATH>", image_path).replace("<IMGWIDTH>", imgwidth)
+                IMG.replace("<IMGPATH>", tex_image_path(image_path)).replace(
+                    "<IMGWIDTH>", imgwidth
+                )
             )
         if block.get("text"):
             contents.append(block["text"])
@@ -528,9 +535,18 @@ def process_file(args, file_dir, bn):
     if args.debug:
         print(f"tectonic found at `{tectonic_path}`")
 
-    subprocess.run(
-        [tectonic_path, os.path.basename(tex_path)], check=True, cwd=file_dir
+    proc = subprocess.run(
+        [tectonic_path, os.path.basename(tex_path)],
+        check=False,
+        cwd=file_dir,
+        text=True,
+        capture_output=True,
     )
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    proc.check_returncode()
 
     for tmp in generator._temp_files:
         try:

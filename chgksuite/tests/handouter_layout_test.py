@@ -4,6 +4,8 @@
 
 import os
 import random
+import subprocess
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -18,7 +20,7 @@ from pypdf.generic import (
 )
 
 from chgksuite.handouter import utils as handouter_utils
-from chgksuite.handouter.runner import HandoutGenerator
+from chgksuite.handouter.runner import HandoutGenerator, process_file
 from chgksuite.handouter.split_fit import (
     HandoutBlock,
     all_q_block_text,
@@ -545,6 +547,28 @@ def test_handout_generator_uses_optimized_image_path(generator, tmp_path):
             os.remove(path)
 
 
+def test_handout_generator_escapes_windows_temp_image_path(generator, monkeypatch):
+    windows_temp_path = (
+        "C:\\Users\\USER~1\\AppData\\Local\\Temp\\2\\tmpigabk_hf.jpg"
+    )
+
+    def fake_optimize_raster_image_for_tex(path, quality=80):
+        return windows_temp_path
+
+    monkeypatch.setattr(
+        "chgksuite.handouter.runner.optimize_raster_image_for_tex",
+        fake_optimize_raster_image_for_tex,
+    )
+
+    tex = generator.generate_regular_block({"image": "handout.png", "columns": 1})
+
+    assert (
+        r"\includegraphics[width=1.0\textwidth]{\detokenize{C:/Users/USER~1/AppData/Local/Temp/2/tmpigabk_hf.jpg}}"
+        in tex
+    )
+    assert windows_temp_path not in tex
+
+
 def test_handout_generator_can_disable_image_optimization(generator, tmp_path):
     image_path = tmp_path / "handout.png"
     write_noisy_png(image_path)
@@ -554,6 +578,50 @@ def test_handout_generator_can_disable_image_optimization(generator, tmp_path):
 
     assert str(image_path) in tex
     assert not generator._temp_files
+
+
+def test_process_file_replays_tectonic_output_on_failure(
+    tmp_path, monkeypatch, capsys
+):
+    class FakeGenerator:
+        _temp_files = []
+
+        def __init__(self, args):
+            self.args = args
+
+        def generate(self):
+            return "\\end{document}"
+
+    def fake_run(cmd, check, cwd, text, capture_output):
+        assert check is False
+        assert text is True
+        assert capture_output is True
+        return subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="tectonic stdout\n",
+            stderr="Undefined control sequence\n",
+        )
+
+    hndt_path = tmp_path / "handout.hndt"
+    hndt_path.write_text("columns: 1\ntext", encoding="utf8")
+    args = SimpleNamespace(
+        filename=str(hndt_path),
+        language="ru",
+        add_n_teams="off",
+        compress_pdf="off",
+        debug=False,
+    )
+    monkeypatch.setattr("chgksuite.handouter.runner.HandoutGenerator", FakeGenerator)
+    monkeypatch.setattr("chgksuite.handouter.runner.get_tectonic_path", lambda: "tectonic")
+    monkeypatch.setattr("chgksuite.handouter.runner.subprocess.run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        process_file(args, str(tmp_path), "handout")
+
+    captured = capsys.readouterr()
+    assert "tectonic stdout" in captured.out
+    assert "Undefined control sequence" in captured.err
 
 
 def test_compress_pdf_keeps_original_when_compressed_file_is_larger(
