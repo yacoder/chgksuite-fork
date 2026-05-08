@@ -547,7 +547,7 @@ def test_handout_generator_uses_optimized_image_path(generator, tmp_path):
             os.remove(path)
 
 
-def test_handout_generator_escapes_windows_temp_image_path(generator, monkeypatch):
+def test_handout_generator_normalizes_windows_temp_image_path(generator, monkeypatch):
     windows_temp_path = (
         "C:\\Users\\USER~1\\AppData\\Local\\Temp\\2\\tmpigabk_hf.jpg"
     )
@@ -563,7 +563,7 @@ def test_handout_generator_escapes_windows_temp_image_path(generator, monkeypatc
     tex = generator.generate_regular_block({"image": "handout.png", "columns": 1})
 
     assert (
-        r"\includegraphics[width=1.0\textwidth]{\detokenize{C:/Users/USER~1/AppData/Local/Temp/2/tmpigabk_hf.jpg}}"
+        r"\includegraphics[width=1.0\textwidth]{C:/Users/USER~1/AppData/Local/Temp/2/tmpigabk_hf.jpg}"
         in tex
     )
     assert windows_temp_path not in tex

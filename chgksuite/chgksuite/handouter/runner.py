@@ -39,7 +39,7 @@ from chgksuite.handouter.utils import (
 
 
 def tex_image_path(image_path):
-    return r"\detokenize{" + str(image_path).replace("\\", "/") + "}"
+    return str(image_path).replace("\\", "/")
 
 
 def rotate_image(image_path, direction):
