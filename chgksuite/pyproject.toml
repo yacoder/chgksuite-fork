@@ -27,7 +27,6 @@ dependencies = [
     "beautifulsoup4",
     "chardet==5.2.0",
     "dateparser",
-    "fonttools",
     "mammoth",
     "openpyxl",
     "parse",

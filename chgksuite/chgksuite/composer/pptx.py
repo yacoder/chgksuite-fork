@@ -7,7 +7,11 @@ import urllib.parse
 
 import toml
 
+import chgksuite.typotools as typotools
 from chgksuite.common import (
+    HYPERLINK_SAFE_CHARS,
+    NO_BREAK_HYPHEN_REPLACEMENT,
+    URL_BREAK_AFTER_CHARS,
     log_wrap,
     optimize_ooxml_images,
     replace_escaped,
@@ -20,7 +24,6 @@ from chgksuite.composer.composer_common import (
     remove_accents_standalone,
 )
 from chgksuite.composer.docx import (
-    _HYPERLINK_SAFE_CHARS,
     _docx_font_name,
     _docx_font_spec,
     _select_font_faces,
@@ -38,8 +41,6 @@ _PPTX_HYPERLINK_COLOR = (0x05, 0x63, 0xC1)
 _EMU_PER_INCH = 914400
 _PX_PER_INCH = 96
 _PT_PER_INCH = 72
-_PPTX_URL_BREAK_AFTER_CHARS = "/.-_\u2011?&=%#:"
-_PPTX_URL_RE = re.compile(r"https?://|www\.")
 
 
 @functools.lru_cache(maxsize=256)
@@ -61,6 +62,13 @@ def optimize_pptx_images(pptx_path, quality=80):
 
 def _get_pptx_handout_text_space_after(handout_cfg):
     return handout_cfg.get("text_space_after", handout_cfg.get("space_after", 18))
+
+
+def set_pptx_run_text(run, text):
+    """Set run text with LibreOffice-safe non-breaking hyphens."""
+    text = str(text).replace("\u2011", NO_BREAK_HYPHEN_REPLACEMENT)
+    run.text = text
+    return run
 
 
 class PptxExporter(BaseExporter):
@@ -557,13 +565,13 @@ class PptxExporter(BaseExporter):
         hyperlink = getattr(run, "hyperlink", None)
         if hyperlink is not None and getattr(hyperlink, "address", None):
             return True
-        return bool(_PPTX_URL_RE.search(text))
+        return bool(typotools.iter_url_spans(text))
 
     def _append_url_wrapping_tokens(self, line, run, text):
         token = ""
         for char in text:
             token += char
-            if char in _PPTX_URL_BREAK_AFTER_CHARS:
+            if char in URL_BREAK_AFTER_CHARS:
                 line.append((run, token, False))
                 line.append((run, "", True))
                 token = ""
@@ -931,12 +939,12 @@ class PptxExporter(BaseExporter):
             if not part:
                 continue
             run = para.add_run()
-            run.text = part
+            set_pptx_run_text(run, part)
             self._apply_run_defaults(run, para, color=color)
             runs.append(run)
         if not runs:
             run = para.add_run()
-            run.text = ""
+            set_pptx_run_text(run, "")
             self._apply_run_defaults(run, para, color=color)
             runs.append(run)
         return runs
@@ -961,7 +969,7 @@ class PptxExporter(BaseExporter):
     def add_hyperlink_runs(self, para, text, url):
         if not self._format_links_enabled():
             return self.add_runs(para, text)
-        hyperlink_url = urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS)
+        hyperlink_url = urllib.parse.quote(url, safe=HYPERLINK_SAFE_CHARS)
         runs = self.add_runs(para, text)
         for run in runs:
             run.hyperlink.address = hyperlink_url

@@ -20,6 +20,10 @@ import xml.etree.ElementTree as ET
 import openpyxl
 import toml
 
+HYPERLINK_SAFE_CHARS = "%/:?#[]@!$&'()*+,;="
+NO_BREAK_HYPHEN_REPLACEMENT = "\u2060-\u2060"
+URL_BREAK_AFTER_CHARS = "/.-_\u2011?&=%#:"
+
 QUESTION_LABELS = [
     "handout",
     "question",

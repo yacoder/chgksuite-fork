@@ -20,6 +20,8 @@ from docx.shared import Pt as DocxPt
 import chgksuite.typotools as typotools
 from chgksuite.common import (
     DummyLogger,
+    HYPERLINK_SAFE_CHARS,
+    NO_BREAK_HYPHEN_REPLACEMENT,
     log_wrap,
     optimize_ooxml_images,
     replace_escaped,
@@ -42,9 +44,7 @@ WHITEN = {
     "author": False,
 }
 
-_HYPERLINK_SAFE_CHARS = "%/:?#[]@!$&'()*+,;="
 _SUPPORTED_FONT_EXTENSIONS = {".ttf", ".otf"}
-_DOCX_NO_BREAK_HYPHEN_REPLACEMENT = "\u2060-\u2060"
 
 
 @dataclass(frozen=True)
@@ -419,7 +419,7 @@ def remove_square_brackets_standalone(s, regexes):
 
 def set_docx_run_text(run, text):
     """Set run text with LibreOffice-safe non-breaking hyphens."""
-    text = str(text).replace("\u2011", _DOCX_NO_BREAK_HYPHEN_REPLACEMENT)
+    text = str(text).replace("\u2011", NO_BREAK_HYPHEN_REPLACEMENT)
     run.text = text
     return run
 
@@ -435,7 +435,7 @@ def add_hyperlink_to_docx(doc, paragraph, text, url):
     run.style = doc.styles["Hyperlink"]
     part = paragraph.part
     r_id = part.relate_to(
-        urllib.parse.quote(url, safe=_HYPERLINK_SAFE_CHARS),
+        urllib.parse.quote(url, safe=HYPERLINK_SAFE_CHARS),
         docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK,
         is_external=True,
     )
